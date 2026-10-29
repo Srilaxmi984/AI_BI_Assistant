@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sales AI Business Intelligence Assistant</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <!-- Chart.js for data visualization -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Top Navigation -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-icon">⚡</div>
+        <div>
+          <h1>Sales BI Assistant</h1>
+          <p class="subtitle">Autonomous AI Query Engine & Decision Support</p>
+        </div>
+      </div>
+      <div class="header-status">
+        <span class="status-indicator"></span>
+        <span class="status-text">SQLite Engine Active (Read-Only)</span>
+        <span class="badge">ReAct Loop</span>
+      </div>
+    </header>
+
+    <main class="main-content">
+      <!-- Executive KPI Cards -->
+      <section class="kpi-grid" id="kpiGrid">
+        <div class="kpi-card">
+          <div class="kpi-label">Total Net Revenue</div>
+          <div class="kpi-value" id="kpiRevenue">$0.00</div>
+          <div class="kpi-subtext" id="kpiRevenueSub">Loading transactions...</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Completed Transactions</div>
+          <div class="kpi-value" id="kpiOrders">0</div>
+          <div class="kpi-subtext" id="kpiUnits">0 units sold</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Top Product</div>
+          <div class="kpi-value highlight-blue" id="kpiTopProduct">-</div>
+          <div class="kpi-subtext" id="kpiTopProductRev">$0.00</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Top Region</div>
+          <div class="kpi-value highlight-purple" id="kpiTopRegion">-</div>
+          <div class="kpi-subtext" id="kpiTopRegionRev">$0.00</div>
+        </div>
+      </section>
+
+      <!-- Query Input Section -->
+      <section class="query-section">
+        <div class="query-box">
+          <div class="input-wrapper">
+            <span class="search-icon">💬</span>
+            <input 
+              type="text" 
+              id="questionInput" 
+              placeholder="Ask any question about sales, products, revenue, or trends (e.g., 'What is the monthly revenue trend?')" 
+              autocomplete="off"
+            />
+            <button id="askBtn" class="primary-btn">
+              <span>Ask Assistant</span>
+              <span class="btn-arrow">→</span>
+            </button>
+          </div>
+          
+          <!-- Sample Question Chips -->
+          <div class="chips-container">
+            <span class="chips-label">Benchmark Questions:</span>
+            <div class="chips-scroll" id="quickChips">
+              <button class="chip" data-q="What is the total revenue?">💰 Total Revenue</button>
+              <button class="chip" data-q="Which product generated the highest revenue?">🏆 Top Product</button>
+              <button class="chip" data-q="What is the monthly revenue trend?">📈 Monthly Trend</button>
+              <button class="chip" data-q="Which region generated the highest sales?">🗺️ Top Region</button>
+              <button class="chip" data-q="How did revenue change between two months?">⚖️ MoM Comparison</button>
+              <button class="chip" data-q="Show data quality audit logs">🔍 Data Quality Audit</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Loading State -->
+      <div id="loadingIndicator" class="loading-state hidden">
+        <div class="spinner"></div>
+        <p>Agent reasoning in progress (Thought → SQL Action → Observation)...</p>
+      </div>
+
+      <!-- Assistant Response Container -->
+      <section id="resultsSection" class="results-container hidden">
+        <!-- Answer Summary Card -->
+        <div class="card answer-card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="icon">💡</span>
+              <h2>Executive Answer</h2>
+            </div>
+            <div class="latency-badge" id="latencyBadge">0 ms</div>
+          </div>
+          <div class="answer-body">
+            <p id="answerText" class="answer-text"></p>
+            <div id="dataQualityAlert" class="quality-alert hidden"></div>
+          </div>
+        </div>
+
+        <!-- Visual Chart Card -->
+        <div id="chartCard" class="card chart-card hidden">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="icon">📊</span>
+              <h2>Data Visualization</h2>
+            </div>
+          </div>
+          <div class="chart-container">
+            <canvas id="biChart"></canvas>
+          </div>
+        </div>
+
+        <!-- Supporting Figures & Key KPIs -->
+        <div id="supportingCard" class="card supporting-card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="icon">🔢</span>
+              <h2>Supporting Key Figures</h2>
+            </div>
+          </div>
+          <div class="figures-grid" id="figuresGrid"></div>
+        </div>
+
+        <!-- Executed SQL & Security Validation Details -->
+        <div class="card sql-card">
+          <div class="card-header" id="sqlToggle">
+            <div class="card-title">
+              <span class="icon">🛡️</span>
+              <h2>Generated SQL Query (Read-Only Validated)</h2>
+            </div>
+            <button class="copy-btn" id="copySqlBtn" title="Copy SQL">Copy SQL</button>
+          </div>
+          <div class="code-block-wrapper">
+            <pre><code id="sqlQueryText" class="sql-code">-- Executed SQL Query will appear here</code></pre>
+          </div>
+        </div>
+
+        <!-- Tabular Query Results -->
+        <div class="card table-card" id="tableCard">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="icon">📋</span>
+              <h2>Database Result Set</h2>
+            </div>
+            <span class="row-count-badge" id="rowCountBadge">0 records</span>
+          </div>
+          <div class="table-responsive">
+            <table id="dataTable" class="bi-table">
+              <thead id="tableHead"></thead>
+              <tbody id="tableBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- ReAct Trace Accordion -->
+        <div class="card trace-card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="icon">🧠</span>
+              <h2>Autonomous Agent ReAct Reasoning Trace</h2>
+            </div>
+          </div>
+          <div class="trace-timeline" id="traceTimeline"></div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="app-footer">
+      <p>Mini AI Business Intelligence Assistant • Built with Python, FastAPI, SQLite & ReAct Architecture</p>
+    </footer>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
