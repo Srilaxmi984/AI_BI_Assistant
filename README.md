@@ -120,7 +120,7 @@ This automatically runs the ETL pipeline (if not already built) and launches the
 
 ## 🧪 Running Automated Tests
 
-Run the full automated test suite (28 test cases covering ETL, SQL validation, analytics, agent logic, and REST API):
+Run the full automated test suite (33 test cases covering ETL, SQL validation, analytics, agent logic, and REST API):
 
 ```bash
 pytest -v
@@ -133,7 +133,7 @@ tests/test_analytics.py ............. PASSED
 tests/test_api.py ................... PASSED
 tests/test_etl.py ................... PASSED
 tests/test_sql_validator.py ......... PASSED
-======================== 28 passed in 2.87s ========================
+======================== 33 passed in 3.81s ========================
 ```
 
 ---

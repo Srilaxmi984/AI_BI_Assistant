@@ -34,7 +34,7 @@ AI assisted in structuring the core **ReAct (Reasoning + Acting) Agent Pattern**
 - **Synthesis**: The agent translates the query result into a natural language executive summary, calculates month-over-month variances, and provides supporting data tables and chart configs.
 
 ### C. Test Automation & Edge Case Generation
-AI was leveraged to author 28 automated test cases across 5 test suites (`test_etl.py`, `test_sql_validator.py`, `test_analytics.py`, `test_agent.py`, `test_api.py`), ensuring complete coverage of security constraints, arithmetic correctness, and REST endpoints.
+AI was leveraged to author 33 automated test cases across 5 test suites (`test_etl.py`, `test_sql_validator.py`, `test_analytics.py`, `test_agent.py`, `test_api.py`), ensuring complete coverage of security constraints, arithmetic correctness, exploratory business questions, and REST endpoints.
 
 ---
 

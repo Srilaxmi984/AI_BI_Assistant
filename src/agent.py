@@ -133,7 +133,7 @@ class SalesBIAgent:
                     """
                 elif "return" in q.lower():
                     sql = """
-                    SELECT transaction_id, order_date, product, quantity, unit_price, status
+                    SELECT transaction_id, order_date, product, quantity, unit_price, gross_revenue, status
                     FROM sales_transactions
                     WHERE status = 'Returned';
                     """
@@ -191,13 +191,36 @@ class SalesBIAgent:
                         "values": [r["total_revenue"] for r in rows],
                         "series_name": "Channel Revenue ($)"
                     }
+                elif "discount" in q.lower():
+                    total_disc = sum(r["total_discount"] for r in rows)
+                    disc_summary = ", ".join([f"{r['product']}: ${r['total_discount']:,.2f}" for r in rows])
+                    answer = f"Total discounts granted amount to **${total_disc:,.2f}** ({disc_summary})."
+                    chart_type = "bar"
+                    chart_config = {
+                        "labels": [r["product"] for r in rows],
+                        "values": [r["total_discount"] for r in rows],
+                        "series_name": "Discounts ($)"
+                    }
                 elif "return" in q.lower():
-                    answer = f"There is {len(rows)} returned order in the dataset: Transaction {rows[0]['transaction_id']} ({rows[0]['product']} x {rows[0]['quantity']} units)."
+                    answer = f"There is {len(rows)} returned order in the dataset: Transaction {rows[0]['transaction_id']} ({rows[0]['product']} x {rows[0]['quantity']} units, ${rows[0]['gross_revenue']:,.2f})."
                     chart_type = "table"
                     chart_config = None
-                elif "audit" in q.lower() or "quality" in q.lower():
+                elif "audit" in q.lower() or "quality" in q.lower() or "missing" in q.lower():
                     answer = f"The dataset has {len(rows)} logged data quality remediation events: 1 missing price imputed (TXN0051), 1 zero-quantity order flagged (TXN0034), and 1 return flagged (TXN0033)."
                     chart_type = "table"
+                    chart_config = None
+                elif "average" in q.lower() or "aov" in q.lower():
+                    aov = rows[0].get("avg_order_value", 0.0)
+                    total_rev = rows[0].get("total_revenue", 0.0)
+                    total_orders = rows[0].get("total_completed_orders", 0)
+                    answer = f"The average order value (AOV) across {total_orders} completed transactions is **${aov:,.2f}** (Total realized revenue: ${total_rev:,.2f})."
+                    chart_type = "metric_card"
+                    chart_config = None
+                elif "unit" in q.lower() or "quantity" in q.lower() or "how many items" in q.lower():
+                    units = rows[0].get("total_units_sold", 0)
+                    orders = rows[0].get("total_completed_orders", 0)
+                    answer = f"A total of **{units} units** were sold across {orders} completed orders."
+                    chart_type = "metric_card"
                     chart_config = None
                 else:
                     rev = rows[0].get("total_revenue", 0.0)

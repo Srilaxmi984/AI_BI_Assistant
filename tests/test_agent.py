@@ -47,3 +47,37 @@ def test_agent_out_of_domain_guardrail(agent):
     res = agent.process_question("What is the capital of France and what is the weather today?")
     assert res["status"] == "out_of_domain"
     assert "specialized in" in res["answer"].lower()
+
+def test_agent_category_breakdown(agent):
+    """Test agent answering product category sales query."""
+    res = agent.process_question("Which category has the highest sales?")
+    assert res["status"] == "success"
+    assert "Accessories" in res["answer"]
+    assert res["chart_type"] == "bar"
+
+def test_agent_channel_breakdown(agent):
+    """Test agent answering sales channel breakdown query."""
+    res = agent.process_question("Show me performance by sales channel")
+    assert res["status"] == "success"
+    assert "Online" in res["answer"]
+    assert "Retail" in res["answer"]
+
+def test_agent_discounts_query(agent):
+    """Test agent calculating total discounts granted."""
+    res = agent.process_question("What were the discounts given?")
+    assert res["status"] == "success"
+    assert "4,500.00" in res["answer"]
+
+def test_agent_average_order_value(agent):
+    """Test agent calculating average order value."""
+    res = agent.process_question("What is the average order value?")
+    assert res["status"] == "success"
+    assert "28,904.00" in res["answer"]
+
+def test_agent_dynamic_month_comparison(agent):
+    """Test agent dynamically parsing and comparing April and May."""
+    res = agent.process_question("How did revenue change between April and May?")
+    assert res["status"] == "success"
+    assert "77,800.00" in res["answer"]
+    assert "32.32%" in res["answer"]
+
