@@ -30,6 +30,8 @@ def test_api_query_endpoint(client):
     assert data["status"] == "success"
     assert "1,445,200.00" in data["answer"]
     assert "supporting_figures" in data
+    assert "mode" in data
+    assert data["mode"] in ("llm", "deterministic", "none")
 
 def test_api_data_quality_endpoint(client):
     """Test /api/data-quality returns audit logs."""

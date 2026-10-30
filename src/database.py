@@ -3,11 +3,17 @@ import pandas as pd
 from typing import List, Dict, Any, Tuple
 from pathlib import Path
 from src.config import PROCESSED_DB_PATH
+from src.sql_validator import SQLValidator, SQLValidationError
 
 class DatabaseManager:
     """
     Manages connections and query execution on the SQLite database.
     Supports strictly read-only execution for analytical querying.
+
+    All calls to execute_query() pass through SQLValidator first — this is the
+    single choke point that guarantees only safe SELECT statements ever run,
+    regardless of whether the SQL came from the deterministic engine, the LLM,
+    or the fallback branch.
     """
 
     def __init__(self, db_path: Path = PROCESSED_DB_PATH):
@@ -28,11 +34,19 @@ class DatabaseManager:
 
     def execute_query(self, query: str, params: Tuple = ()) -> List[Dict[str, Any]]:
         """
-        Executes a read-only query and returns rows as dictionaries.
+        Validates then executes a read-only query, returning rows as dicts.
+
+        SQLValidator runs on every call — this is the single choke point for
+        all question queries. The ETL write path uses execute_write_script()
+        and is intentionally left separate.
         """
+        is_valid, sanitized_sql, error_msg = SQLValidator.validate_and_sanitize(query)
+        if not is_valid:
+            raise SQLValidationError(f"SQL validation failed: {error_msg}")
+
         with self.get_connection(read_only=True) as conn:
             cursor = conn.cursor()
-            cursor.execute(query, params)
+            cursor.execute(sanitized_sql, params)
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
 

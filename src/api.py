@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Optional
 from pathlib import Path
 from datetime import datetime, timezone
 
-from src.agent import SalesBIAgent
+from src.agent import SalesBIAgent, MAX_QUESTION_LENGTH
 from src.database import DatabaseManager
 from src.etl import run_etl
 from src.config import PROCESSED_DB_PATH, BASE_DIR
@@ -36,7 +36,12 @@ agent = SalesBIAgent(db_mgr)
 
 # Pydantic Request / Response Models
 class QueryRequest(BaseModel):
-    question: str = Field(..., description="Natural language question about sales data", min_length=1)
+    question: str = Field(
+        ...,
+        description="Natural language question about sales data",
+        min_length=1,
+        max_length=MAX_QUESTION_LENGTH,
+    )
 
 class QueryResponse(BaseModel):
     question: str
@@ -50,6 +55,7 @@ class QueryResponse(BaseModel):
     execution_time_ms: float
     data_quality_note: Optional[str] = None
     status: str
+    mode: str = "none"  # "llm" | "deterministic" | "none"
 
 # Endpoints
 @app.post("/api/query", response_model=QueryResponse, summary="Ask a natural language question")
