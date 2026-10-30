@@ -1,346 +1,342 @@
-let chartInstance = null;
+/* ── app.js — Mini AI BI Assistant ─────────────────────────────────
+   Handles:
+     • Light/dark mode (localStorage)
+     • KPI cards from GET /api/kpis
+     • Question form + chip buttons + char counter + Enter submit
+     • POST /api/query response rendering:
+         - mode badge (llm | deterministic | none)
+         - status banner (rejected / out_of_domain / error)
+         - answer text (with basic markdown bold)
+         - line chart, bar chart, metric_card, or table chart type
+         - data table from table_data
+         - collapsible SQL + reasoning trace
+   ─────────────────────────────────────────────────────────────────── */
+'use strict';
 
-document.addEventListener("DOMContentLoaded", () => {
-  loadKPIs();
-  setupEventListeners();
+// ── Theme ────────────────────────────────────────────────────────────
+(function () {
+  const saved = localStorage.getItem('bi-theme') || 'light';
+  document.getElementById('body').className = saved;
+  document.getElementById('themeIcon').textContent = saved === 'dark' ? '☀️' : '🌙';
+})();
+
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const body = document.getElementById('body');
+  const icon = document.getElementById('themeIcon');
+  const isDark = body.classList.toggle('dark');
+  body.classList.toggle('light', !isDark);
+  localStorage.setItem('bi-theme', isDark ? 'dark' : 'light');
+  icon.textContent = isDark ? '☀️' : '🌙';
 });
 
-// Fetch and display headline KPIs
+// ── KPI Cards ─────────────────────────────────────────────────────────
 async function loadKPIs() {
   try {
-    const res = await fetch("/api/kpis");
-    if (!res.ok) return;
-    const data = await res.json();
+    const r = await fetch('/api/kpis');
+    if (!r.ok) return;
+    const d = await r.json();
+    setText('kpi-revenue-val', '$' + fmt(d.total_revenue));
+    setText('kpi-orders', d.completed_orders + ' completed orders');
+    setText('kpi-units-val', fmtInt(d.total_units_sold));
+    setText('kpi-product-val', d.top_product);
+    setText('kpi-product-rev', '$' + fmt(d.top_product_revenue) + ' net');
+    setText('kpi-region-val', d.top_region);
+    setText('kpi-region-rev', '$' + fmt(d.top_region_revenue) + ' net');
+  } catch (_) { /* silently continue — KPI load failure is non-critical */ }
+}
+loadKPIs();
 
-    document.getElementById("kpiRevenue").textContent = formatCurrency(data.total_revenue);
-    document.getElementById("kpiRevenueSub").textContent = `Gross: ${formatCurrency(data.gross_revenue)} | Discounts: ${formatCurrency(data.total_discounts)}`;
-    
-    document.getElementById("kpiOrders").textContent = data.completed_orders.toLocaleString();
-    document.getElementById("kpiUnits").textContent = `${data.total_units_sold.toLocaleString()} units sold`;
+// ── Chips ─────────────────────────────────────────────────────────────
+document.querySelectorAll('.chip').forEach(chip => {
+  chip.addEventListener('click', () => {
+    document.getElementById('questionInput').value = chip.dataset.q;
+    updateCharCount();
+    document.getElementById('askForm').dispatchEvent(new Event('submit'));
+  });
+});
 
-    document.getElementById("kpiTopProduct").textContent = data.top_product;
-    document.getElementById("kpiTopProductRev").textContent = formatCurrency(data.top_product_revenue);
+// ── Char counter ─────────────────────────────────────────────────────
+const qInput = document.getElementById('questionInput');
+qInput.addEventListener('input', updateCharCount);
+function updateCharCount() {
+  const len = qInput.value.length;
+  const el = document.getElementById('charCount');
+  el.textContent = len + ' / 500';
+  el.style.color = len > 480 ? '#ef4444' : '';
+}
 
-    document.getElementById("kpiTopRegion").textContent = data.top_region;
-    document.getElementById("kpiTopRegionRev").textContent = formatCurrency(data.top_region_revenue);
-  } catch (err) {
-    console.error("Failed to load KPIs:", err);
+// ── Form submit ───────────────────────────────────────────────────────
+document.getElementById('askForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const question = qInput.value.trim();
+  if (!question) return;
+
+  if (question.length > 500) {
+    showError('Question is too long (' + question.length + ' chars). Max 500.');
+    return;
   }
-}
 
-// Event Listeners
-function setupEventListeners() {
-  const askBtn = document.getElementById("askBtn");
-  const input = document.getElementById("questionInput");
-  const chips = document.querySelectorAll(".chip");
-  const copyBtn = document.getElementById("copySqlBtn");
-
-  askBtn.addEventListener("click", () => handleQuery(input.value));
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") handleQuery(input.value);
-  });
-
-  chips.forEach((chip) => {
-    chip.addEventListener("click", () => {
-      const q = chip.getAttribute("data-q");
-      input.value = q;
-      handleQuery(q);
-    });
-  });
-
-  copyBtn.addEventListener("click", () => {
-    const sql = document.getElementById("sqlQueryText").textContent;
-    navigator.clipboard.writeText(sql).then(() => {
-      copyBtn.textContent = "Copied!";
-      setTimeout(() => { copyBtn.textContent = "Copy SQL"; }, 2000);
-    });
-  });
-}
-
-// Handle User Query Submission
-async function handleQuery(question) {
-  if (!question || !question.trim()) return;
-
-  const loadingIndicator = document.getElementById("loadingIndicator");
-  const resultsSection = document.getElementById("resultsSection");
-
-  loadingIndicator.classList.remove("hidden");
-  resultsSection.classList.add("hidden");
+  hideError();
+  showSpinner(true);
+  showEmpty(false);
+  hideAnswer();
 
   try {
-    const res = await fetch("/api/query", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question: question.trim() })
+    const r = await fetch('/api/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question }),
     });
 
-    if (!res.ok) {
-      throw new Error(`Server returned HTTP ${res.status}`);
+    if (r.status === 422) {
+      const err = await r.json();
+      const detail = err.detail?.[0]?.msg || 'Validation error — question may be too long.';
+      showError(detail);
+      return;
+    }
+    if (!r.ok) {
+      showError('Server error (' + r.status + '). Please try again.');
+      return;
     }
 
-    const data = await res.json();
-    renderResults(data);
+    const data = await r.json();
+    renderAnswer(data);
   } catch (err) {
-    alert("Query failed: " + err.message);
+    showError('Network error — is the server running? (' + err.message + ')');
   } finally {
-    loadingIndicator.classList.add("hidden");
+    showSpinner(false);
   }
-}
+});
 
-// Render Results
-function renderResults(data) {
-  const resultsSection = document.getElementById("resultsSection");
-  resultsSection.classList.remove("hidden");
+// ── Render answer ─────────────────────────────────────────────────────
+let chartInstance = null;
 
-  // Latency & Answer
-  document.getElementById("latencyBadge").textContent = `${data.execution_time_ms} ms`;
-  document.getElementById("answerText").innerHTML = formatMarkdown(data.answer);
-
-  // Data Quality Note
-  const qualityAlert = document.getElementById("dataQualityAlert");
-  if (data.data_quality_note) {
-    qualityAlert.textContent = `ℹ️ ${data.data_quality_note}`;
-    qualityAlert.classList.remove("hidden");
+function renderAnswer(d) {
+  // Status banner
+  const banner = document.getElementById('statusBanner');
+  banner.className = 'status-banner';
+  const nonSuccess = ['rejected', 'out_of_domain', 'error', 'invalid_request'];
+  if (nonSuccess.includes(d.status)) {
+    const labels = {
+      rejected: '🚫 Request rejected — SQL injection pattern detected in question.',
+      out_of_domain: '🔍 Out of scope — this assistant covers sales data only.',
+      error: '⚠️ An error occurred.',
+      invalid_request: '⚠️ Invalid request.',
+    };
+    banner.textContent = labels[d.status] || d.status;
+    banner.classList.add(d.status, 'visible');
+    banner.classList.remove('hidden');
   } else {
-    qualityAlert.classList.add("hidden");
+    banner.classList.add('hidden');
   }
 
-  // Supporting Figures
-  renderSupportingFigures(data.supporting_figures);
-
-  // Executed SQL
-  document.getElementById("sqlQueryText").textContent = data.sql_query || "-- No SQL query generated for this response";
-
-  // Data Table
-  renderTable(data.table_data);
-
-  // Chart Rendering
-  renderChart(data);
-
-  // ReAct Trace
-  renderTrace(data.reasoning_trace);
-
-  // Smooth scroll into view
-  resultsSection.scrollIntoView({ behavior: "smooth", block: "start" });
-}
-
-// Helper: Format Markdown bold & bullets
-function formatMarkdown(text) {
-  if (!text) return "";
-  let formatted = text
-    .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*(.*?)\*/g, "<em>$1</em>")
-    .replace(/\n\n/g, "<br><br>")
-    .replace(/\n/g, "<br>");
-  return formatted;
-}
-
-// Helper: Format Currency
-function formatCurrency(num) {
-  if (num === null || num === undefined) return "$0.00";
-  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(num);
-}
-
-// Render Supporting Figures
-function renderSupportingFigures(figures) {
-  const container = document.getElementById("figuresGrid");
-  container.innerHTML = "";
-
-  if (!figures || Object.keys(figures).length === 0) {
-    container.innerHTML = "<p style='color: var(--text-muted); font-size: 0.85rem;'>No scalar supporting figures returned.</p>";
-    return;
+  // Mode badge
+  const wrap = document.getElementById('modeBadgeWrap');
+  wrap.innerHTML = '';
+  if (d.mode === 'llm') {
+    wrap.innerHTML = '<span class="badge badge-llm" title="Answered by Gemini LLM — SQL validated before execution">🤖 LLM</span>';
+  } else if (d.mode === 'deterministic') {
+    wrap.innerHTML = '<span class="badge badge-det" title="Answered by verified deterministic SQL">✅ Deterministic</span>';
   }
 
-  for (const [key, val] of Object.entries(figures)) {
-    // Skip nested arrays or objects
-    if (typeof val === "object" && val !== null) continue;
+  // Question + answer
+  setText('answerQuestion', '"' + d.question + '"');
+  const bodyEl = document.getElementById('answerBody');
+  bodyEl.innerHTML = renderMarkdown(d.answer || '');
 
-    const box = document.createElement("div");
-    box.className = "figure-box";
+  // Metric card / chart / table
+  toggleEl('metricCard', false);
+  toggleEl('chartWrap', false);
+  toggleEl('tableWrap', false);
 
-    const label = document.createElement("div");
-    label.className = "figure-box-label";
-    label.textContent = key.replace(/_/g, " ");
-
-    const value = document.createElement("div");
-    value.className = "figure-box-val";
-
-    if (typeof val === "number") {
-      if (key.includes("revenue") || key.includes("price") || key.includes("discount") || key.includes("change")) {
-        value.textContent = formatCurrency(val);
-      } else if (key.includes("pct") || key.includes("percent") || key.includes("share")) {
-        value.textContent = `${val}%`;
-      } else {
-        value.textContent = val.toLocaleString();
-      }
-    } else {
-      value.textContent = String(val);
-    }
-
-    box.appendChild(label);
-    box.appendChild(value);
-    container.appendChild(box);
-  }
-}
-
-// Render Tabular Data
-function renderTable(rows) {
-  const tableHead = document.getElementById("tableHead");
-  const tableBody = document.getElementById("tableBody");
-  const rowCountBadge = document.getElementById("rowCountBadge");
-  const tableCard = document.getElementById("tableCard");
-
-  tableHead.innerHTML = "";
-  tableBody.innerHTML = "";
-
-  if (!rows || rows.length === 0) {
-    tableCard.classList.add("hidden");
-    return;
+  if (d.chart_type === 'metric_card' && d.supporting_figures) {
+    const figures = d.supporting_figures;
+    const firstKey = Object.keys(figures)[0];
+    const firstVal = figures[firstKey];
+    document.getElementById('metricValue').textContent = fmtValue(firstKey, firstVal);
+    document.getElementById('metricLabel').textContent = friendlyKey(firstKey);
+    toggleEl('metricCard', true);
+  } else if ((d.chart_type === 'line' || d.chart_type === 'bar') && d.chart_config) {
+    renderChart(d.chart_type, d.chart_config);
+    toggleEl('chartWrap', true);
   }
 
-  tableCard.classList.remove("hidden");
-  rowCountBadge.textContent = `${rows.length} record${rows.length === 1 ? '' : 's'}`;
+  // Data table (shown for all types with table_data)
+  if (d.table_data && d.table_data.length > 0) {
+    buildTable(d.table_data);
+    toggleEl('tableWrap', true);
+  }
 
-  const headers = Object.keys(rows[0]);
-  const trHead = document.createElement("tr");
-  headers.forEach((h) => {
-    const th = document.createElement("th");
-    th.textContent = h.replace(/_/g, " ");
-    trHead.appendChild(th);
+  // SQL + reasoning
+  const sql = d.sql_query || '';
+  document.querySelector('#sqlBlock code').textContent = sql || '(no SQL executed)';
+
+  const traceList = document.getElementById('traceList');
+  traceList.innerHTML = '';
+  (d.reasoning_trace || []).forEach(step => {
+    const li = document.createElement('li');
+    li.innerHTML = '<strong>' + esc(step.step) + ':</strong> ' + esc(step.detail);
+    traceList.appendChild(li);
   });
-  tableHead.appendChild(trHead);
 
-  rows.forEach((row) => {
-    const tr = document.createElement("tr");
-    headers.forEach((h) => {
-      const td = document.createElement("td");
-      const val = row[h];
-      if (typeof val === "number" && (h.includes("revenue") || h.includes("price") || h.includes("discount"))) {
-        td.textContent = formatCurrency(val);
-        td.style.fontWeight = "600";
-      } else {
-        td.textContent = val !== null && val !== undefined ? val : "-";
-      }
-      tr.appendChild(td);
-    });
-    tableBody.appendChild(tr);
-  });
+  setText('execTime', d.execution_time_ms + ' ms');
+  setText('dataNote', d.data_quality_note || '');
+
+  showAnswer();
 }
 
-// Render Chart with Chart.js
-function renderChart(data) {
-  const chartCard = document.getElementById("chartCard");
-  const ctx = document.getElementById("biChart").getContext("2d");
-
-  if (!data.chart_config || !data.chart_config.labels || data.chart_config.labels.length === 0) {
-    chartCard.classList.add("hidden");
-    if (chartInstance) {
-      chartInstance.destroy();
-      chartInstance = null;
-    }
-    return;
-  }
-
-  chartCard.classList.remove("hidden");
-
-  if (chartInstance) {
-    chartInstance.destroy();
-  }
-
-  const isLine = data.chart_type === "line";
-  const labels = data.chart_config.labels;
-  const values = data.chart_config.values;
-  const seriesName = data.chart_config.series_name || "Revenue ($)";
-
-  // Gradient fill for sleek UI
-  const gradient = ctx.createLinearGradient(0, 0, 0, 300);
-  gradient.addColorStop(0, "rgba(99, 102, 241, 0.7)");
-  gradient.addColorStop(1, "rgba(56, 189, 248, 0.1)");
+// ── Chart ─────────────────────────────────────────────────────────────
+function renderChart(type, config) {
+  if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+  const ctx = document.getElementById('mainChart').getContext('2d');
+  const isDark = document.getElementById('body').classList.contains('dark');
+  const gridColor = isDark ? 'rgba(255,255,255,.08)' : 'rgba(0,0,0,.07)';
+  const tickColor = isDark ? '#a0a0c0' : '#555568';
+  const accent = '#6366f1';
+  const accentFill = type === 'line' ? 'rgba(99,102,241,0.12)' : accent;
 
   chartInstance = new Chart(ctx, {
-    type: isLine ? "line" : "bar",
+    type: type,
     data: {
-      labels: labels,
+      labels: config.labels,
       datasets: [{
-        label: seriesName,
-        data: values,
-        backgroundColor: isLine ? gradient : "rgba(99, 102, 241, 0.8)",
-        borderColor: "#38bdf8",
-        borderWidth: 2,
-        borderRadius: isLine ? 0 : 8,
-        tension: 0.35,
-        fill: isLine,
-        pointBackgroundColor: "#38bdf8",
-        pointBorderColor: "#ffffff",
-        pointRadius: 5
-      }]
+        label: config.series_name || 'Value',
+        data: config.values,
+        backgroundColor: type === 'bar'
+          ? config.values.map((_, i) => `hsl(${240 + i * 22},70%,${isDark ? 55 : 50}%)`)
+          : accentFill,
+        borderColor: accent,
+        borderWidth: type === 'line' ? 2.5 : 0,
+        borderRadius: type === 'bar' ? 6 : 0,
+        pointBackgroundColor: accent,
+        pointRadius: type === 'line' ? 4 : 0,
+        fill: type === 'line',
+        tension: 0.38,
+      }],
     },
     options: {
       responsive: true,
-      maintainAspectRatio: false,
+      animation: { duration: 500 },
       plugins: {
-        legend: {
-          display: true,
-          labels: { color: "#94a3b8", font: { family: "Inter", size: 12 } }
-        },
+        legend: { display: false },
         tooltip: {
-          backgroundColor: "rgba(15, 23, 42, 0.95)",
-          titleColor: "#f8fafc",
-          bodyColor: "#38bdf8",
-          borderColor: "#334155",
-          borderWidth: 1,
-          padding: 12,
           callbacks: {
-            label: function(context) {
-              return ` ${context.dataset.label}: ${formatCurrency(context.parsed.y)}`;
-            }
-          }
-        }
+            label: (ctx) => {
+              const v = ctx.parsed.y;
+              return typeof v === 'number' && v > 100
+                ? ' $' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+                : ' ' + v;
+            },
+          },
+        },
       },
       scales: {
         x: {
-          grid: { color: "rgba(255, 255, 255, 0.05)" },
-          ticks: { color: "#94a3b8", font: { family: "Inter" } }
+          ticks: { color: tickColor, maxRotation: 45 },
+          grid: { color: gridColor },
         },
         y: {
-          grid: { color: "rgba(255, 255, 255, 0.05)" },
           ticks: {
-            color: "#94a3b8",
-            font: { family: "Inter" },
-            callback: function(val) {
-              return formatCurrency(val);
-            }
-          }
-        }
-      }
-    }
+            color: tickColor,
+            callback: (v) => typeof v === 'number' && v >= 1000 ? '$' + (v / 1000).toFixed(0) + 'k' : v,
+          },
+          grid: { color: gridColor },
+        },
+      },
+    },
   });
 }
 
-// Render ReAct Reasoning Trace
-function renderTrace(trace) {
-  const container = document.getElementById("traceTimeline");
-  container.innerHTML = "";
+// ── Table ─────────────────────────────────────────────────────────────
+function buildTable(rows) {
+  const keys = Object.keys(rows[0]);
+  const head = document.getElementById('tableHead');
+  const body = document.getElementById('tableBody');
 
-  if (!trace || trace.length === 0) {
-    container.innerHTML = "<p style='color: var(--text-muted); font-size: 0.85rem;'>No trace available.</p>";
-    return;
-  }
+  head.innerHTML = '<tr>' + keys.map(k =>
+    '<th>' + friendlyKey(k) + '</th>'
+  ).join('') + '</tr>';
 
-  trace.forEach((t) => {
-    const stepDiv = document.createElement("div");
-    stepDiv.className = "trace-step";
+  body.innerHTML = rows.map(row =>
+    '<tr>' + keys.map(k => {
+      const v = row[k];
+      const isNum = typeof v === 'number';
+      const isMoney = /revenue|amount|price|discount|gross|net|cost/i.test(k);
+      const cell = isNum && isMoney
+        ? '$' + fmt(v)
+        : isNum
+          ? fmtInt(v)
+          : esc(String(v ?? ''));
+      return '<td' + (isNum ? ' class="num"' : '') + '>' + cell + '</td>';
+    }).join('') + '</tr>'
+  ).join('');
+}
 
-    const tag = document.createElement("span");
-    tag.className = `trace-tag tag-${t.step.toLowerCase()}`;
-    tag.textContent = t.step;
+// ── Helpers ────────────────────────────────────────────────────────────
+function setText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
 
-    const text = document.createElement("div");
-    text.className = "trace-text";
-    text.textContent = t.detail;
+function toggleEl(id, show) {
+  const el = document.getElementById(id);
+  if (el) el.classList.toggle('hidden', !show);
+}
 
-    stepDiv.appendChild(tag);
-    stepDiv.appendChild(text);
-    container.appendChild(stepDiv);
-  });
+function showSpinner(show) {
+  toggleEl('spinner', show);
+  document.getElementById('submitBtn').disabled = show;
+}
+
+function showEmpty(show) { toggleEl('emptyState', show); }
+
+function showAnswer() {
+  document.getElementById('emptyState').classList.add('hidden');
+  document.getElementById('answerCard').classList.remove('hidden');
+}
+
+function hideAnswer() {
+  document.getElementById('answerCard').classList.add('hidden');
+}
+
+function showError(msg) {
+  document.getElementById('errorMsg').textContent = msg;
+  document.getElementById('errorBanner').classList.remove('hidden');
+}
+
+function hideError() {
+  document.getElementById('errorBanner').classList.add('hidden');
+}
+
+function fmt(n) {
+  return Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function fmtInt(n) {
+  return Number(n).toLocaleString('en-US', { maximumFractionDigits: 0 });
+}
+
+function fmtValue(colName, val) {
+  if (typeof val !== 'number') return String(val);
+  const col = colName.toLowerCase();
+  if (/revenue|amount|price|discount|gross|net|cost/.test(col)) return '$' + fmt(val);
+  if (/pct|percent|rate/.test(col)) return val.toFixed(2) + '%';
+  return Number.isInteger(val) ? fmtInt(val) : fmt(val);
+}
+
+function friendlyKey(k) {
+  return k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function esc(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// Basic **bold** markdown → <strong>
+function renderMarkdown(text) {
+  return esc(text).replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
 }
