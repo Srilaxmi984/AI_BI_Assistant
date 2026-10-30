@@ -1,5 +1,9 @@
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env file if present (ignored in production where env vars are set directly)
+load_dotenv()
 
 # Base Paths
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -23,10 +27,10 @@ CATALOG_PRICES = {
     "Wireless Mouse": 650.0
 }
 
-# AI Engine Configuration
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "auto") # auto, gemini, openai, fallback
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# AI / LLM Configuration
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.6-flash")
+LLM_ENABLED = os.getenv("LLM_ENABLED", "true").lower() in ("true", "1", "t")
 
 # Security / SQL Guardrails
 ALLOWED_TABLES = {"sales_transactions", "v_completed_sales", "data_quality_audit"}
