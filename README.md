@@ -1,151 +1,229 @@
-# ⚡ Mini AI Business Intelligence Assistant
+# Mini AI Business Intelligence Assistant
 
-A placement-project Business Intelligence assistant: ask a question in plain English, get an answer backed by verified SQL, with interactive charts and a full reasoning trace.
+A small application that lets a business user ask questions about sales data in plain English and get answers backed by real SQL queries. Every answer shows the SQL that ran, the rows it returned, and a step-by-step trace of how it was produced.
 
----
-
-## 🌟 How It Works
-
-The assistant uses a **keyword router + Gemini LLM** approach:
-
-- **Known question types** (total revenue, top product, monthly trend, top region, month-to-month change, category, channel, discount, returns, data quality) route directly to **verified deterministic SQL** — the answer is always exact.
-- **Unknown question types** go to the **Gemini LLM** (`gemini-3.6-flash` via `LLM_MODEL` in `.env`), which generates a SQL query. That SQL is validated by a token-level `sqlparse` choke point before any execution — destructive statements are blocked regardless of source.
-- If the LLM is unavailable or the question is outside sales data, a clear "I can't answer that" is returned.
-
-### Security layers (in order)
-1. `max_length=500` on the question → HTTP 422 if exceeded
-2. Regex attack-pattern guard on the question *text* (blocks `DROP TABLE`, `DELETE FROM`, etc. in the question itself)
-3. Keyword out-of-domain guard for obvious non-sales questions
-4. LLM `OUT_OF_SCOPE` sentinel → `status: out_of_domain`
-5. `SQLValidator.validate_and_sanitize` in `database.execute_query` — **every** SQL statement passes through this, regardless of origin
-6. SQLite `PRAGMA query_only = ON` engine lock
+Built with Python, FastAPI, SQLite and Chart.js, for an AI-assisted development assessment.
 
 ---
 
-## 📊 Benchmark Questions & Exact Answers
+## How questions are answered
+
+The app uses two paths, and the response always says which one was used in its `mode` field.
+
+| Path | When | `mode` |
+|---|---|---|
+| **Verified engine** | Known question types: total revenue, top product, monthly trend, top region, change between two months, plus a few exploratory ones (category, channel, discounts, returns, data quality, average order value, units) | `deterministic` |
+| **Gemini text-to-SQL** | Business questions the router does not recognise | `llm` |
+| **Refused** | Empty, too long, SQL-attack patterns, out of domain, or unanswerable | `none` |
+
+How the Gemini path works:
+
+1. The model receives the question, the schema and the allowed views, and writes **one SELECT**.
+2. The SQL is validated (see Security below) and run on a read-only connection.
+3. The answer text is built by **Python from the returned rows**. The model never writes the numbers.
+4. If validation fails, the app retries once, feeding the error back to the model. If that also fails, or there is no API key, or the model errors, it falls back to the verified engine or says it cannot answer.
+
+The app works without an API key: the verified engine handles all benchmark questions.
+
+---
+
+## Benchmark questions and answers
 
 | # | Question | Answer |
 |---|---|---|
-| Q1 | What is the total revenue? | **$1,445,200.00** net (50 completed orders) |
-| Q2 | Which product generated the highest revenue? | **Monitor** — $473,000.00 |
-| Q3 | What is the monthly revenue trend? | Jan $210,250 → peak May $318,500 → Jun $217,250 |
-| Q4 | Which region generated the highest sales? | **South** — $411,200.00 |
-| Q5 | How did revenue change between January and February? | **+$24,350.00 (+11.58%)** |
+| 1 | What is the total revenue? | **$1,445,200.00** net (gross $1,449,700.00, discounts $4,500.00, 50 completed orders) |
+| 2 | Which product generated the highest revenue? | **Monitor**, $473,000.00 |
+| 3 | What is the monthly revenue trend? | $210,250.00 in January 2026, peak $318,500.00 in May, $217,250.00 in June |
+| 4 | Which region generated the highest sales? | **South**, $411,200.00 (about 28.5% of total) |
+| 5 | How did revenue change between two months? | January to February 2026: **+$24,350.00 (+11.58%)** |
+
+Revenue always means completed orders only (view `v_completed_sales`).
 
 ---
 
-## 🏗️ Project Structure
+## Project structure
 
 ```
-mini_bi_assistant/
+AI_BI_Assistant/
 ├── data/
-│   ├── raw/sales_data.csv          # Raw 51 sales transaction records
-│   ├── processed/sales.db          # Cleaned SQLite database with indexes & views
-│   └── data_dictionary.md
-│
+│   ├── raw/sales_data.csv         # 51 supplied sales transactions
+│   ├── processed/sales.db         # SQLite database, built by the ETL (git-ignored)
+│   └── data_dictionary.md         # Column documentation
 ├── src/
-│   ├── config.py                   # Paths, catalog prices, LLM settings (loads .env)
-│   ├── database.py                 # SQLite manager — validate_and_sanitize choke point here
-│   ├── sql_validator.py            # Token-level validation via sqlparse
-│   ├── etl.py                      # Ingestion, cleaning, imputation, audit logging
-│   ├── analytical_engine.py        # Deterministic queries & keyword intent router
-│   ├── llm_client.py               # google-genai SDK wrapper (gemini-3.6-flash)
-│   ├── agent.py                    # ReAct loop: guards → router → LLM → deterministic
-│   └── api.py                      # FastAPI REST app & static file server
-│
-├── static/                         # Web UI (HTML/CSS/JS + Chart.js)
-├── tests/                          # 59 automated tests
-├── docs/                           # Architecture & future cloud notes
-├── .env.example                    # Copy this to .env and add your API key
+│   ├── config.py                  # Paths, catalog prices, env settings
+│   ├── database.py                # SQLite access; validates every query (single choke point)
+│   ├── sql_validator.py           # Token-level SQL validation with sqlparse
+│   ├── etl.py                     # CSV load, cleaning, imputation, audit log
+│   ├── analytical_engine.py       # Intent router and verified SQL for known questions
+│   ├── llm_client.py              # Gemini client (google-genai)
+│   ├── agent.py                   # Guards, routing, LLM path, answer building
+│   └── api.py                     # FastAPI app and static file server
+├── static/                        # index.html, style.css, app.js (Chart.js UI)
+├── tests/                         # pytest suite (LLM is always mocked)
+├── docs/
+│   ├── architecture.md            # Diagrams and design explanation
+│   └── cloud_deployment_aws.md    # Future work note (not implemented)
+├── .env.example                   # Settings template (no secrets)
+├── pytest.ini
 ├── requirements.txt
-├── run.py
-├── REPORT.md
+├── run.py                         # One-command start
+├── REPORT.md                      # AI tools used, problems, debugging, improvements
 └── README.md
 ```
 
 ---
 
-## 🚀 Quickstart
+## Setup and run
 
-### 1. Prerequisites
-- Python 3.10+ (tested on 3.13)
+Requires Python 3.10+ and git.
 
-### 2. Installation
 ```bash
-git clone <repo-url>
+git clone https://github.com/Srilaxmi984/AI_BI_Assistant.git
 cd AI_BI_Assistant
 
 python -m venv venv
 # Windows:
 venv\Scripts\activate
-# Linux/macOS:
+# macOS / Linux:
 source venv/bin/activate
 
 pip install -r requirements.txt
 ```
 
-### 3. Set up your API key (optional — app works without one)
+### Optional: enable the Gemini path
+
 ```bash
-copy .env.example .env        # Windows
-# or: cp .env.example .env   # Linux/macOS
+# Windows PowerShell
+Copy-Item .env.example .env
+# macOS / Linux
+cp .env.example .env
 ```
 
-Open `.env` and set:
+Open `.env` and set your key (get one at https://aistudio.google.com/apikey):
+
 ```
-GOOGLE_API_KEY=your-key-here
+GOOGLE_API_KEY=your_key_here
+LLM_MODEL=gemini-3.6-flash
+LLM_ENABLED=true
 ```
 
-> ⚠️ **Never commit `.env`** — it is already in `.gitignore`.  
-> Without a key, the assistant runs in deterministic-only mode and answers all known question types correctly. Only truly ad-hoc/unknown questions need the LLM.
+- Never commit `.env`. It is listed in `.gitignore`; only `.env.example` is tracked.
+- Set `LLM_ENABLED=false`, or leave the key empty, to use only the verified engine.
+- Model names change over time. If the model call fails, check the current model list in the Gemini API docs and update `LLM_MODEL`.
 
-### 4. Launch
+### Start the app
+
 ```bash
 python run.py
 ```
-- Web Dashboard: [http://127.0.0.1:8000](http://127.0.0.1:8000)
-- Swagger API Docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+`run.py` builds the database from the CSV if it does not exist, then starts the server.
+
+- Dashboard: http://127.0.0.1:8000
+- API docs (Swagger): http://127.0.0.1:8000/docs
 
 ---
 
-## 🧪 Running Tests
+## API
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/query` | Body: `{"question": "..."}` (1 to 500 characters, otherwise HTTP 422) |
+| `GET /api/kpis` | Headline numbers for the dashboard cards |
+| `GET /api/data-quality` | The data quality audit log |
+| `GET /health` | Health check |
+
+`/api/query` returns:
+
+```json
+{
+  "question": "What is the total revenue?",
+  "answer": "...",
+  "sql_query": "SELECT ...",
+  "supporting_figures": {},
+  "table_data": [],
+  "chart_type": "metric_card",
+  "chart_config": null,
+  "reasoning_trace": [{"step": "Thought", "detail": "..."}],
+  "execution_time_ms": 4.2,
+  "data_quality_note": "...",
+  "status": "success",
+  "mode": "deterministic"
+}
+```
+
+`status` is one of `success`, `rejected`, `out_of_domain`, `invalid_request`, `error`. `mode` is `llm`, `deterministic` or `none`.
+
+---
+
+## Tests
 
 ```bash
 python -m pytest -q
 ```
 
-59 tests — ETL, SQL validation, analytics benchmarks, agent logic, REST API, LLM guardrails.
+The suite has **59 tests** covering ETL, the SQL validator, the five benchmark answers, the agent and its guards, the REST API, and the LLM path.
+
+- The LLM is **mocked** in every test, so no API key or network is needed.
+- Valid questions: all five benchmark answers are asserted to the exact figure.
+- Invalid and malicious input: empty question, a 501-character question (HTTP 422), `DROP TABLE` in the question text, stacked queries, destructive SQL returned by a mocked model.
+- Edge cases: out-of-domain questions, model failure with fallback, no API key, "show me the revenue update for May" (the word "update" must not trigger a rejection), and a check that SQL from the model is validated before it runs.
 
 ---
 
-## 🗄️ How Data Is Stored and Queried
+## How data is stored and queried
 
-1. **ETL** (`src/etl.py`): reads `sales_data.csv` (51 rows), normalises dates from `DD-MM-YYYY` to `ISO 8601`, imputes 1 missing unit price from catalog, flags zero-quantity and returned orders, logs all decisions to `data_quality_audit`.
-2. **SQLite database** (`data/processed/sales.db`):
-   - `sales_transactions` — raw and cleaned data with `is_imputed` flag
-   - `v_completed_sales` — view filtering `WHERE status = 'Completed'`; used for **all** revenue calculations
-   - `data_quality_audit` — one row per anomaly detected during ETL
-   - Indexes on `product`, `region`, `year_month` for fast GROUP BY queries
-3. **Query execution**: every SQL statement — whether from the deterministic engine, the LLM, or an exploratory branch — goes through `database.execute_query()`, which calls `SQLValidator.validate_and_sanitize()` before touching SQLite. The connection also has `PRAGMA query_only = ON`.
-
----
-
-## 🛡️ Data Quality & Anomaly Handling
-
-| Issue | Record | Action |
-|---|---|---|
-| Missing unit price | TXN0051 — Laptop Stand | Imputed $1,200 from catalog; `is_imputed=1` |
-| Zero quantity | TXN0034 — Keyboard | Flagged `ZERO_QUANTITY`; $0 revenue |
-| Returned order | TXN0033 — Monitor 2 units | Flagged `RETURNED_ORDER`; excluded from `v_completed_sales` |
-
-Audit trail available at `GET /api/data-quality`.
+1. `src/etl.py` loads `data/raw/sales_data.csv` (51 transactions).
+2. Cleaning rules:
+   - Dates in `DD-MM-YYYY` are converted to ISO `YYYY-MM-DD`, and a `year_month` column (`YYYY-MM`) is added and indexed so months sort correctly.
+   - The one missing unit price (`TXN0051`, Laptop Stand) is filled from the product catalog price ($1,200) and flagged `is_imputed = 1`.
+   - The zero-quantity order (`TXN0034`) is flagged `ZERO_QUANTITY` and contributes $0 revenue.
+   - The returned order (`TXN0033`, Monitor, $19,000) is flagged `RETURNED_ORDER`.
+   - Every fix is written to the `data_quality_audit` table with a timestamp.
+3. Data is stored in SQLite (`data/processed/sales.db`):
+   - `sales_transactions`: all records, including the returned one, for auditing.
+   - `v_completed_sales`: a view of completed orders only. All revenue figures come from this view.
+   - `data_quality_audit`: the cleaning log.
+4. Every question query runs on a read-only connection (`PRAGMA query_only = ON`) after passing the validator.
 
 ---
 
-## ⚠️ Known Limitations
+## Security and guardrails
 
-- **Small dataset**: 51 rows, 50 completed orders. Results are exact for this dataset but not statistically significant.
-- **Completed orders only**: only `status = 'Completed'` rows count as revenue. Returned and zero-quantity records are excluded.
-- **Known question types only (without key)**: without a Gemini API key the assistant only answers the named question categories listed above. Truly ad-hoc questions return "I can't answer that."
-- **LLM SQL not guaranteed**: the LLM generates SQL that satisfies the rules most of the time, but its output is validated and all rows are always shown alongside the answer so you can verify it.
-- **No multi-turn memory**: each question is answered independently; there is no session context.
-- **Keyword router coverage**: the intent router recognises the 5 benchmark questions and ~7 exploratory categories by keyword. New question types require either a Gemini key or extending the router.
+Checks run in this order for every question:
+
+1. **Empty or whitespace question**: rejected.
+2. **Length**: more than 500 characters is rejected (HTTP 422 at the API).
+3. **Attack patterns in the question text**: phrases like `drop table`, `delete from`, `insert into`, `update ... set`, `truncate table`, `alter table`, or `;` followed by a SQL keyword are rejected with status `rejected`. Ordinary words such as "update" alone are fine.
+4. **Out of domain**: non-sales questions are refused without running a query.
+5. **SQL validation** (`sql_validator.py`, applied inside `database.py` so nothing bypasses it): token-level checks with `sqlparse`.
+   - Exactly one statement, and it must be a `SELECT`.
+   - Destructive and administrative keywords are blocked (`DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, `CREATE`, `REPLACE`, `ATTACH`, `DETACH`, `TRUNCATE`, `PRAGMA`, and similar).
+   - Only these tables and views may be referenced: `sales_transactions`, `v_completed_sales`, `data_quality_audit`.
+   - A `LIMIT 1000` is added when none is present.
+6. **Read-only connection**: even if validation were bypassed, SQLite refuses writes.
+
+Validation is token-level plus a whitelist; it is not a full SQL parser.
+
+Preventing wrong answers: numbers in answers are computed or formatted by Python from the returned rows, revenue questions are pointed at `v_completed_sales`, and the SQL, rows and reasoning trace are always shown so a person can check the result.
+
+---
+
+## Known limitations
+
+- The dataset is small (51 rows), so results demonstrate the design, not scale.
+- Only completed orders count as revenue; the returned order is excluded.
+- The keyword router recognises a limited set of question types; anything else depends on the Gemini path.
+- SQL written by the model is not guaranteed to match what the user meant, which is why the SQL and rows are always displayed.
+- There is no multi-turn memory: each question is answered on its own.
+- Out-of-domain detection uses a keyword list plus the model's own refusal, so unusual off-topic questions can slip through to the model path.
+- Validation is token-level (sqlparse), not a full parser.
+- Not production-hardened: there is no authentication, rate limiting or persistent logging.
+
+---
+
+## More documentation
+
+- [docs/architecture.md](docs/architecture.md): diagrams and design decisions
+- [REPORT.md](REPORT.md): AI tools used, problems found, debugging, and improvements
+- [docs/cloud_deployment_aws.md](docs/cloud_deployment_aws.md): future work note

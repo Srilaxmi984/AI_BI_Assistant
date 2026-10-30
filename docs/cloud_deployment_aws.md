@@ -1,17 +1,12 @@
-# Future Work: Cloud Deployment
+# Future work: cloud deployment (not implemented)
 
-> **This document describes potential future architecture only — nothing here is implemented.**
-> The current application runs locally as a single Python/FastAPI process with SQLite.
+This project runs locally with SQLite. It has not been deployed to any cloud service, and nothing in this repository is built or tested for one.
 
-## Possible AWS Serverless Architecture
+If it were deployed, a reasonable direction would be:
 
-The application could be deployed to AWS as follows:
+- Run the FastAPI app as a container on a managed service (for example AWS Lambda behind API Gateway, or a container service).
+- Replace the bundled SQLite file with a managed read-only database or a query service over files in object storage, because a Lambda filesystem is read-only and temporary.
+- Keep the API key in a secrets manager and add authentication and rate limiting in front of `/api/query`.
+- Add centralised logs and metrics for the reasoning trace and request latency.
 
-1. **Compute**: Package with Docker; run as an AWS Lambda Container Image behind Amazon API Gateway (using the `mangum` ASGI adapter).
-2. **Database**: Replace SQLite with Amazon Aurora Serverless (PostgreSQL) or query S3 Parquet files via Amazon Athena.
-3. **LLM**: Replace the `google-genai` SDK with the Amazon Bedrock Converse API (e.g. Claude 3.x).
-4. **Static assets**: Serve `static/` from Amazon S3 + CloudFront.
-5. **CI/CD**: GitHub Actions → push Docker image to ECR → update Lambda.
-
-This would require significant rework of `database.py`, `llm_client.py`, and the ETL pipeline.
-There is no `deploy.yml` workflow in this repository.
+These are ideas for further work, not features of the current submission.

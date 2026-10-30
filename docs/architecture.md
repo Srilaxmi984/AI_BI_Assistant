@@ -1,165 +1,138 @@
 # Architecture
 
-## System Overview
+## 1. Overview
+
+The app turns a plain-English question into a validated SQL query, runs it on a read-only SQLite database, and builds the answer from the returned rows. A request goes through a few guards, then one of two paths:
+
+- **Verified engine**: fixed SQL for known question types.
+- **Gemini text-to-SQL**: the model writes one SELECT for questions the router does not recognise.
+
+Both paths run their SQL through the same validator, in the same place (`database.py`).
 
 ```mermaid
 flowchart TD
-    User([User Browser]) -->|"POST /api/query"| API["FastAPI\n(api.py)"]
-    User -->|"GET /api/kpis"| API
-    API --> Agent["SalesBIAgent\n(agent.py)"]
+    User([Business user]) -->|question| UI[Web dashboard]
+    UI -->|POST /api/query| API[FastAPI api.py]
+    API -->|length check, 1 to 500 chars| Agent[SalesBIAgent agent.py]
 
-    subgraph Guards ["Guard Chain (in order)"]
-        G1["1. max_length > 500 → HTTP 422"]
-        G2["2. SQL attack-pattern regex → rejected"]
-        G3["3. Irrelevant-keyword out-of-domain → out_of_domain"]
-        G1 --> G2 --> G3
+    subgraph Guards
+        Agent --> G1{Empty?}
+        G1 -->|no| G2{SQL attack pattern in text?}
+        G2 -->|no| G3{Out of domain?}
     end
 
-    Agent --> Guards
+    G1 -->|yes| Refuse[Refuse, mode none]
+    G2 -->|yes| Refuse
+    G3 -->|yes| Refuse
 
-    Guards --> Router{"Intent\nRouter"}
+    G3 -->|no| Router{Known intent?}
+    Router -->|yes| Engine[Verified engine analytical_engine.py]
+    Router -->|no| LLM[Gemini llm_client.py writes one SELECT]
+    LLM -->|SQL fails validation twice, or LLM error, or no key| Fallback[Exploratory SQL or cannot answer]
 
-    Router -->|"known intent"| DET["Deterministic Engine\n(analytical_engine.py)\n5 benchmark methods"]
-    Router -->|"unknown intent"| LLM_PATH["LLM Path\n(llm_client.py → gemini-3.6-flash)"]
+    Engine --> DB
+    LLM --> DB
+    Fallback --> DB
 
-    LLM_PATH -->|"OUT_OF_SCOPE"| OOD["out_of_domain, mode=none"]
-    LLM_PATH -->|"SQL returned"| VAL
-
-    DET --> DB
-
-    subgraph Choke ["SQL Choke Point (database.py)"]
-        VAL["SQLValidator.validate_and_sanitize\n(sqlparse token-level)"]
-        DB["SQLite\n(PRAGMA query_only=ON)"]
-        VAL -->|"PASS"| DB
-        VAL -->|"FAIL → retry with error"| LLM_PATH
+    subgraph DB[database.py single choke point]
+        V[SQLValidator, token-level checks] --> RO[(SQLite, PRAGMA query_only = ON)]
     end
 
-    DB --> Response["Response\n{answer, mode, sql_query,\ntable_data, chart_config,\nreasoning_trace}"]
-
-    subgraph Fallback ["LLM Unavailable fallback"]
-        EXP["Named exploratory SQL\n(channel/category/discount/…)"]
-        NOPE["'I can't answer'\nmode=none, status=out_of_domain"]
-    end
-
-    LLM_PATH -->|"no key / all retries fail"| Fallback
-    EXP --> DB
+    RO -->|rows| Build[Python builds answer, table and chart]
+    Build -->|JSON with mode| UI
 ```
 
 ---
 
-## Guard Order in `process_question()`
-
-| Step | Condition | Result |
-|---|---|---|
-| 1 | `len(question) > 500` | HTTP 422 (Pydantic `max_length`) |
-| 2 | SQL attack pattern in text | `status: rejected, mode: none` |
-| 3 | Irrelevant keyword AND `intent==unknown` | `status: out_of_domain, mode: none` |
-| 4 | `intent != "unknown"` | → Deterministic engine (step 7) |
-| 5a | LLM returns `OUT_OF_SCOPE` | `status: out_of_domain, mode: none` |
-| 5b | LLM returns valid SQL | validate → execute → `mode: llm` |
-| 5c | LLM retry | feed validation error back in user_prompt |
-| 5d | All retries fail | → step 6 |
-| 6 | Named exploratory keyword present | → exploratory SQL branch, `mode: deterministic` |
-| 6 | No keyword, no LLM | `"I can't answer…"`, `mode: none` |
-| 7 | Deterministic engine | verified fixed SQL, `mode: deterministic` |
-
----
-
-## SQL Validation Choke Point
-
-Every SQL statement — from the deterministic engine, the LLM, or an exploratory branch — passes through `DatabaseManager.execute_query()`, which calls `SQLValidator.validate_and_sanitize()` before touching SQLite.
-
-```
-SQLValidator (sqlparse token-level)
-  ├── Single SELECT statement only
-  ├── Dangerous keyword blacklist (DROP, DELETE, UPDATE, INSERT, ALTER, TRUNCATE…)
-  ├── Table whitelist (v_completed_sales, sales_transactions, data_quality_audit)
-  └── PASS → SQLite with PRAGMA query_only = ON
-```
-
----
-
-## Sequence: Known Question (e.g. "What is the total revenue?")
+## 2. Request flow
 
 ```mermaid
 sequenceDiagram
-    participant U as User
-    participant A as api.py
-    participant AG as agent.py
-    participant AE as analytical_engine.py
-    participant DB as database.py + SQLite
+    autonumber
+    actor U as User
+    participant UI as Dashboard
+    participant API as FastAPI
+    participant A as Agent
+    participant L as Gemini
+    participant D as Database + Validator
+    participant S as SQLite read-only
 
-    U->>A: POST /api/query
-    A->>AG: process_question()
-    AG->>AG: Guards pass
-    AG->>AE: detect_intent() → "total_revenue"
-    AG->>AE: get_total_revenue()
-    AE->>DB: execute_query(sql)
-    DB->>DB: validate_and_sanitize() PASS
-    DB-->>AE: rows
-    AE-->>AG: result {answer, $1,445,200.00}
-    AG-->>A: {mode: "deterministic", status: "success"}
-    A-->>U: JSON response
-```
+    U->>UI: asks a question
+    UI->>API: POST /api/query
+    API->>A: process_question()
+    Note over A: Guards: empty, length, attack patterns, out of domain
 
----
-
-## Sequence: Unknown Question (LLM path)
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant AG as agent.py
-    participant L as llm_client.py
-    participant G as gemini-3.6-flash
-    participant V as SQLValidator
-    participant DB as SQLite
-
-    U->>AG: "What is the revenue per customer segment?"
-    AG->>AG: intent = "unknown", guards pass
-    AG->>L: generate_sql(question, error_hint="")
-    L->>G: generate_content(system_prompt + user_prompt)
-    G-->>L: "SELECT segment, SUM(net_revenue)..."
-    L-->>AG: sql string
-    AG->>V: validate_and_sanitize(sql)
-    alt PASS
-        V-->>AG: (True, sanitized_sql, None)
-        AG->>DB: execute_query(sanitized_sql)
-        DB-->>AG: rows
-        AG-->>U: {mode:"llm", status:"success"}
-    else FAIL (attempt 1)
-        V-->>AG: (False, "", error_msg)
-        AG->>L: generate_sql(question, error_hint=error_msg)
-        L->>G: retry with error appended
-        G-->>L: corrected SQL
+    alt known question type
+        A->>D: verified SQL
+    else unknown question type
+        A->>L: question + schema + allowed views
+        L-->>A: one SELECT (or OUT_OF_SCOPE)
+        A->>D: generated SQL
     end
+
+    D->>D: validate (single SELECT, whitelist, no write keywords, LIMIT)
+    alt validation fails
+        D-->>A: rejected
+        A->>L: retry once, with the error
+    else valid
+        D->>S: execute
+        S-->>D: rows
+        D-->>A: rows
+    end
+
+    Note over A: Python builds the answer from rows
+    A-->>API: answer, SQL, rows, chart, trace, mode
+    API-->>UI: JSON
+    UI-->>U: answer, chart, table, SQL and trace
 ```
 
 ---
 
-## mode Field
+## 3. Components
 
-Every `/api/query` response includes `mode`:
-
-| Value | Meaning |
+| File | Role |
 |---|---|
-| `"deterministic"` | Answered by verified fixed SQL (benchmark or named exploratory) |
-| `"llm"` | Answered by Gemini-generated SQL, validated before execution |
-| `"none"` | Rejected, out_of_domain, invalid_request, or error — no SQL ran |
+| `src/etl.py` | Loads the CSV, normalises dates, imputes the missing price, flags returns and zero quantity, writes the audit log |
+| `src/database.py` | Opens read-only connections and validates every query before it runs |
+| `src/sql_validator.py` | Token-level validation with `sqlparse`, table whitelist, `LIMIT` enforcement |
+| `src/analytical_engine.py` | Intent detection and the verified SQL for known questions |
+| `src/llm_client.py` | Calls Gemini through the `google-genai` SDK; strips code fences; `OUT_OF_SCOPE` detection |
+| `src/agent.py` | Guards, routing between engine and Gemini, retry and fallback, answer formatting |
+| `src/api.py` | HTTP endpoints, request limits, response model |
+| `static/` | Dashboard: KPI cards, Chart.js chart, data table, SQL and trace panel |
 
 ---
 
-## File Map
+## 4. Why two paths
 
-| File | Responsibility |
+Known questions use fixed SQL, so their answers are exact and repeatable. The five benchmark answers always come from this path. Gemini adds flexibility for other questions, but its SQL cannot be trusted blindly, so it is validated, run read-only, and displayed for checking. If anything goes wrong, the system degrades to the verified engine or a clear "cannot answer" message, never to a made-up answer.
+
+---
+
+## 5. Defense in depth
+
+1. **Question text**: empty, over 500 characters, and SQL-attack phrases are rejected before any query exists.
+2. **Validator**: one statement, SELECT only, write and admin keywords blocked, tables limited to `sales_transactions`, `v_completed_sales`, `data_quality_audit`, and `LIMIT 1000` added if missing.
+3. **Engine lock**: connections use `PRAGMA query_only = ON`, so even a missed case cannot change data.
+4. **Output**: numbers come from Python formatting of returned rows, never from model text.
+
+---
+
+## 6. Preventing wrong or unsupported answers
+
+| Risk | Mitigation |
 |---|---|
-| `src/config.py` | Paths, catalog prices, LLM settings; loads `.env` via `python-dotenv` |
-| `src/database.py` | SQLite connection; **validator choke point** in `execute_query()` |
-| `src/sql_validator.py` | Token-level `sqlparse` validation; `SQLValidationError` |
-| `src/etl.py` | CSV → SQLite ETL; imputation; audit logging |
-| `src/analytical_engine.py` | 5 deterministic benchmarks + keyword intent router |
-| `src/llm_client.py` | `google-genai` wrapper; `OUT_OF_SCOPE` detection; fence stripping |
-| `src/agent.py` | ReAct loop; all guards; LLM retry; mode field |
-| `src/api.py` | FastAPI; `QueryResponse` with `mode`; 500-char limit |
-| `static/` | Web UI: HTML, CSS, Chart.js |
-| `tests/` | 59 automated tests across 6 suites |
+| Wrong revenue (returned order included) | Revenue SQL targets `v_completed_sales`; the Gemini prompt requires it |
+| Model invents numbers | The model only writes SQL; Python builds the sentence from rows |
+| Destructive or invalid SQL | Validator plus read-only connection |
+| Off-topic question | Keyword guard plus the model's `OUT_OF_SCOPE` reply |
+| Model unavailable, bad key, retired model | Falls back to the verified engine or says it cannot answer |
+| User cannot judge the answer | SQL, rows, mode and reasoning trace are always returned |
+
+---
+
+## 7. Mapping to common agent frameworks
+
+- The loop (guard, choose a tool, run it, observe the rows, write the answer) matches a ReAct-style agent. In LangGraph it would be a graph with a router node, a SQL tool node, a validator node, and a retry edge.
+- Google ADK would model the engine and the SQL runner as tools for a single agent.
+- RAG is not needed here: the data is structured and the retrieval is exact SQL. Retrieval over a table with a query is closer to "vectorless" retrieval than to embedding search. Embeddings would only help for a text corpus such as a business glossary, which this project does not have.
