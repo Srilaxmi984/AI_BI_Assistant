@@ -1,106 +1,92 @@
-# System Architecture
+# Architecture
 
-## 1. High-Level Architecture Overview
-The Mini AI Business Intelligence Assistant is designed with a **layered, decoupled ReAct (Reasoning + Acting) architecture**. It bridges natural language queries from business stakeholders to deterministic database execution while enforcing zero-trust data safety and anti-hallucination guardrails.
+## Component Overview
 
-```mermaid
-flowchart TD
-    User([Business Stakeholder]) -->|Natural Language Question| UI[Interactive BI Web Dashboard]
-    UI -->|HTTP POST /api/query| API[FastAPI Application Backend]
-    
-    subgraph Agentic Reasoning Engine
-        API --> Agent[SalesBIAgent - ReAct Coordinator]
-        Agent -->|1. Thought: Intent & Guardrails| IntentRouter[Semantic Router & Domain Guardrail]
-        IntentRouter -->|2. Action: Formulate SQL| SQLGen[Analytical Engine / SQL Synthesizer]
-        SQLGen -->|3. Validate Query| Validator[SQLValidator - AST & Keyword Scanner]
-    end
-
-    subgraph Defense-in-Depth Database Layer
-        Validator -->|Pass: Sanitized Read-Only Query| EngineLock[SQLite Engine Lock: PRAGMA query_only = ON]
-        EngineLock --> DB[(SQLite Database: sales.db)]
-        DB -->|4. Observation: Verified Rowset| Agent
-    end
-
-    subgraph Synthesis & Presentation
-        Agent -->|5. Synthesis: Grounded Narrative| API
-        API -->|Structured JSON Response| UI
-        UI -->|Render| Cards[KPI Cards]
-        UI -->|Render| Visuals[Chart.js Visualizations]
-        UI -->|Render| Audit[Executed SQL & ReAct Trace]
-    end
+```
+User Browser
+     │
+     ▼
+FastAPI (api.py)
+  ├── POST /api/query  ──► SalesBIAgent.process_question()
+  ├── GET  /api/kpis   ──► AnalyticalEngine (direct)
+  └── GET  /api/*      ──► DatabaseManager (direct)
 ```
 
----
+## Guard Order in process_question()
 
-## 2. ReAct (Reasoning + Acting) Cycle
-
-The assistant implements an explicit multi-step ReAct loop:
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor User as Business User
-    participant UI as Web Dashboard
-    participant API as FastAPI Backend
-    participant Agent as SalesBIAgent
-    participant Validator as SQLValidator
-    participant DB as SQLite (Read-Only)
-
-    User->>UI: Types: "What is the monthly revenue trend?"
-    UI->>API: POST /api/query {"question": "..."}
-    API->>Agent: process_question()
-    
-    Note over Agent: Step 1: THOUGHT<br/>Detect intent, extract month entities, verify domain
-    
-    Note over Agent: Step 2: ACTION<br/>Formulate analytical query for monthly revenue aggregation
-    Agent->>Validator: validate_and_sanitize(SQL)
-    
-    alt SQL contains destructive keyword or invalid table
-        Validator-->>Agent: Violation Detected (Security Rejection)
-        Agent-->>API: Safe rejection message
-    else Query is Safe SELECT
-        Validator-->>Agent: Query Approved with safety LIMIT
-        Agent->>DB: execute_query(sanitized_sql)
-        DB-->>Agent: Step 3: OBSERVATION (6 monthly rowsets)
-    end
-
-    Note over Agent: Step 4: SYNTHESIS<br/>Calculate MoM %, identify peak month, bind KPIs to numbers
-    Agent-->>API: Return structured answer, KPIs, table data & chart config
-    API-->>UI: JSON Payload (answer, sql, chart, trace, latency)
-    UI-->>User: Displays Executive Narrative, Line Chart, and SQL Trace
+```
+1. max_length > 500 → HTTP 422 (enforced in api.py via Pydantic max_length;
+                                  also checked in agent for non-HTTP callers)
+2. _SQL_ATTACK_PATTERNS match → status: rejected, mode: none
+3. Known-irrelevant keyword AND intent==unknown → status: out_of_domain, mode: none
+4. intent != "unknown" → go to step 7 (deterministic engine)
+5. intent == "unknown" → try LLM:
+     a. LLM returns "OUT_OF_SCOPE"  → status: out_of_domain, mode: none
+     b. LLM returns SQL → validate → execute → status: success, mode: llm
+     c. Retry once, feeding validation error back to LLM
+     d. All retries fail → continue to step 6
+6. No named exploratory keyword → status: out_of_domain, mode: none
+                                    "I can't answer that question…"
+7. Deterministic engine / named exploratory SQL → status: success, mode: deterministic
 ```
 
----
+## SQL Validation Choke Point
 
-## 3. Defense-in-Depth SQL Security
-To satisfy strict enterprise security requirements and eliminate risk of data tampering or SQL injection:
+`DatabaseManager.execute_query()` calls `SQLValidator.validate_and_sanitize()` on **every** SQL string before it reaches SQLite, regardless of whether the SQL came from the deterministic engine, the LLM, or an exploratory branch.
 
-1. **Token & AST Inspection (`SQLValidator`)**:
-   - Every statement is parsed using `sqlparse`.
-   - Piggyback / multi-statement queries (`SELECT ...; DROP TABLE ...`) are rejected immediately.
-   - Prohibits non-`SELECT` statement types (`DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, `CREATE`, `REPLACE`, `ATTACH`, `DETACH`, `TRUNCATE`, `EXEC`, `PRAGMA`, `GRANT`, `REVOKE`).
+```
+SQLValidator (sqlparse token-level)
+  ├── Single SELECT statement only
+  ├── Dangerous keyword blacklist (DROP, DELETE, UPDATE, INSERT, ALTER, TRUNCATE, …)
+  ├── Table whitelist (v_completed_sales, sales_transactions, data_quality_audit)
+  └── Pass → SQLite with PRAGMA query_only = ON
+```
 
-2. **Schema Entity Whitelisting**:
-   - Queries are only permitted to reference explicit analytical entities: `sales_transactions`, `v_completed_sales`, and `data_quality_audit`.
-   - Access to internal SQLite tables (`sqlite_master`, `sqlite_sequence`) is denied.
+## Sequence: Known Question Type
 
-3. **Database Engine Enforcement**:
-   - Every analytical connection is initialized with:
-     ```sql
-     PRAGMA query_only = ON;
-     ```
-   - Even if a malicious command bypassed software regex and AST validation, SQLite's storage engine will throw a fatal `sqlite3.OperationalError: attempt to write a readonly database`.
+```
+User → "What is the total revenue?"
+  → api.py POST /api/query
+  → agent: intent = "total_revenue"
+  → AnalyticalEngine.get_total_revenue()
+     → DatabaseManager.execute_query(sql)
+        → SQLValidator: PASS
+        → SQLite (query_only=ON)
+  → "$1,445,200.00", mode: deterministic
+```
 
-4. **Resource Bounds**:
-   - If a query lacks an explicit `LIMIT` clause, `SQLValidator` automatically appends `LIMIT 1000` to prevent memory exhaustion and Denial-of-Service.
+## Sequence: Unknown Question Type (LLM active)
 
----
+```
+User → "Which customers bought in Q1?"
+  → api.py POST /api/query
+  → agent: intent = "unknown"
+  → LLMClient.generate_sql(question)
+     → gemini-3.6-flash (google-genai SDK, _SYSTEM_PROMPT)
+     → Returns SQL (or "OUT_OF_SCOPE")
+  → SQLValidator: validate
+     ↳ FAIL? → retry with error appended, then fallback
+     ↳ PASS  → DatabaseManager.execute_query(sanitized_sql)
+                 → SQLite (query_only=ON)
+  → mode: llm
+```
 
-## 4. Preventing Hallucinations & Incorrect Answers
+## File Map
 
-| Challenge | Prevention Mechanism |
-| :--- | :--- |
-| **Hallucinated numbers** | Answers are synthesized strictly from the executed query's rowset. Numbers are formatted directly from database aggregates. |
-| **Invalid question types** | Out-of-domain questions (e.g. weather, politics, recipes) trigger guardrails that redirect the user to business intelligence topics. |
-| **Data anomalies & dirty data** | ETL pipeline automatically imputes missing catalog prices, flags returned items, detects zero quantities, and logs every action in `data_quality_audit`. |
-| **Full auditability** | Every response exposes the exact SQL query executed, the latency in milliseconds, and the step-by-step ReAct reasoning trace. |
+| File | Responsibility |
+|---|---|
+| `src/config.py` | Paths, catalog prices, LLM settings; loads `.env` via `python-dotenv` |
+| `src/database.py` | SQLite connection; **validator choke point** in `execute_query()` |
+| `src/sql_validator.py` | Token-level `sqlparse` validation; `SQLValidationError` |
+| `src/etl.py` | CSV → SQLite ETL; imputation; audit logging |
+| `src/analytical_engine.py` | 5 deterministic benchmarks + keyword intent router |
+| `src/llm_client.py` | `google-genai` wrapper; `OUT_OF_SCOPE` detection; fence stripping |
+| `src/agent.py` | ReAct loop; all guards; LLM retry; mode field |
+| `src/api.py` | FastAPI; `QueryResponse` with `mode`; 500-char limit |
+
+## mode Field
+
+Every `/api/query` response includes `mode`:
+- `"deterministic"` — answered by a verified fixed SQL query
+- `"llm"` — answered by Gemini-generated SQL (validated before execution)
+- `"none"` — rejected, out_of_domain, or error

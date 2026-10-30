@@ -1,92 +1,93 @@
 # Project Development & Technical Evaluation Report
 
 ## 1. Executive Summary
-This report documents the architectural decisions, development methodology, problem-solving journey, and future roadmap for the **Mini AI Business Intelligence Assistant**. The application was built to enable non-technical business users to query transaction data in natural language and receive verifiable, deterministic answers backed by actual database queries.
+
+This report documents the architectural decisions, development methodology, problems encountered, and future roadmap for the **Mini AI Business Intelligence Assistant** — a placement project that lets non-technical users query sales transaction data in plain English and receive verifiable answers backed by audited SQL.
 
 ---
 
 ## 2. Which AI Tools Were Used
-During development, the following AI tools and models were utilized:
-1. **Antigravity Agentic Assistant (powered by Google Gemini 3.8)**:
-   - Used for interactive pair-programming, automated code generation, test case authoring, and exploratory data analysis.
-   - Operated with direct filesystem and shell command execution capabilities to automate testing and iteration cycles.
-2. **LLM Foundation Models (Amazon Bedrock / Claude 3.5 Sonnet & OpenAI GPT-4o Reference Architectures)**:
-   - Used to formulate prompt designs for text-to-SQL generation, zero-shot schema understanding, and executive business narrative synthesis.
-3. **AST-based SQL Grammar Parsers (`sqlparse`)**:
-   - Deployed as an AI guardrail and syntactic verification filter to validate SQL tokens before execution.
+
+[DEV_TOOLS_USED]
+
+**Runtime AI tooling:**
+- **`google-genai` SDK** — the official Google Gen AI Python SDK, used at runtime to call `gemini-3.6-flash` (configured via `LLM_MODEL` in `.env`). This model is the current stable Flash generation as documented at [ai.google.dev](https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash).
+- **`sqlparse`** — token-level SQL parser used as a guardrail to validate every SQL statement before execution.
 
 ---
 
 ## 3. How AI Was Used During Development
 
-### A. Accelerated Data Exploration & Anomaly Profiling
-AI was used to inspect the raw 51-row transaction CSV file to rapidly identify statistical distributions, missing values, and anomalies before authoring the database schema. AI scripts detected:
-- The missing `Unit_price` in record `TXN0051`.
-- The single returned order `TXN0033`.
-- The zero-quantity record `TXN0034`.
-- The `DD-MM-YYYY` date formats that required normalization into ISO `YYYY-MM-DD`.
+### A. Data Exploration & Anomaly Profiling
+AI was used to inspect the raw 51-row CSV and rapidly identify data quality issues before authoring the schema:
+- Missing `Unit_price` in `TXN0051`
+- Returned order `TXN0033` inflating gross revenue
+- Zero-quantity order `TXN0034`
+- European date format (`DD-MM-YYYY`) requiring ISO normalisation
 
-### B. Architecture & ReAct Loop Implementation
-AI assisted in structuring the core **ReAct (Reasoning + Acting) Agent Pattern**:
-- **Thought**: The agent parses the user's natural language input, performs entity extraction (e.g. matching month names like "January" and "February" to `2026-01` and `2026-02`), and evaluates domain boundaries.
-- **Action**: The agent either selects a deterministic query tool or synthesizes a targeted SQL query.
-- **Observation**: The query is validated and executed against SQLite with read-only pragma locks.
-- **Synthesis**: The agent translates the query result into a natural language executive summary, calculates month-over-month variances, and provides supporting data tables and chart configs.
+### B. Architecture & ReAct Loop Design
+AI assisted in structuring the **ReAct (Reasoning + Acting)** pattern:
+- **Thought**: parse intent and apply guards
+- **Action**: route to deterministic engine or LLM
+- **Observation**: validate and execute SQL
+- **Synthesis**: format result for the user
 
-### C. Test Automation & Edge Case Generation
-AI was leveraged to author 33 automated test cases across 5 test suites (`test_etl.py`, `test_sql_validator.py`, `test_analytics.py`, `test_agent.py`, `test_api.py`), ensuring complete coverage of security constraints, arithmetic correctness, exploratory business questions, and REST endpoints.
+The keyword router handles the 5 benchmark questions and ~7 exploratory categories with deterministic SQL. Unknown questions go to `gemini-3.6-flash` for text-to-SQL generation, with a retry loop that feeds validation errors back to the model.
+
+### C. Test Authoring
+AI generated 59 automated test cases across 6 suites covering ETL, SQL validation, analytics benchmarks, agent guardrails, REST endpoints, and LLM-path mocking.
+
+### D. Relationship to Agentic Frameworks
+This ReAct loop implements the same concepts as **LangChain/LangGraph** (tool-calling agent with observation + memory) and **Google ADK** (agent with guardrails and tool dispatch), but as plain Python to keep it transparent and interviewable.
+
+**Why RAG is not needed**: the data is structured (tabular sales records). SQL retrieval on `v_completed_sales` is exact — there is nothing to embed or approximate. RAG is better suited for unstructured document corpora. Vectorless, schema-grounded SQL retrieval is the correct choice here.
 
 ---
 
 ## 4. Problems Encountered & How They Were Debugged
 
-### Problem 1: Silent Revenue Corruption via Missing Unit Price (`TXN0051`)
-- **Issue**: Transaction `TXN0051` had an empty `Unit_price` field. If loaded as `NULL`, standard SQL aggregations like `SUM(quantity * unit_price)` would either drop the record or yield incorrect results ($1,439,200 instead of $1,445,200).
-- **Diagnosis**: Running exploratory pandas profiling revealed that `Unit_price` had 1 null value, but all other `Laptop Stand` orders consistently had a unit price of $1,200.00.
-- **Resolution**: Implemented an automated imputation policy during ETL. The pipeline maintains a master product catalog price map, imputes missing prices with $1,200.00, sets `is_imputed = 1`, and logs a record to `data_quality_audit` for full governance.
+### Problem 1: Revenue Corruption — Missing Unit Price (TXN0051)
+- **Issue**: `TXN0051` had an empty `Unit_price`. Standard `SUM()` would silently undercount revenue by $6,000.
+- **Diagnosis**: pandas profiling found 1 null in `Unit_price`; comparing with other Laptop Stand orders confirmed $1,200.00 as the correct price.
+- **Resolution**: ETL imputation pipeline with catalog price map; `is_imputed=1` flag; `data_quality_audit` log entry.
 
-### Problem 2: Misleading Revenue from Returned Orders (`TXN0033`)
-- **Issue**: Transaction `TXN0033` (Monitor, Quantity 2, Price $9,500 = $19,000) was marked as `Status = 'Returned'`. If included in gross revenue, it inflates commercial performance with uncollected income.
-- **Diagnosis**: Grouping revenue by status showed 50 completed orders and 1 returned order.
-- **Resolution**: Created a dedicated analytical database view `v_completed_sales` that filters `WHERE status = 'Completed'`, ensuring that all executive metrics represent realized sales. Simultaneously, the raw `sales_transactions` table preserves the returned record for auditing.
+### Problem 2: Inflated Revenue from Returned Orders (TXN0033)
+- **Issue**: Returned Monitor order ($19,000) inflated gross revenue figures.
+- **Resolution**: `v_completed_sales` view filters `WHERE status = 'Completed'`; all revenue calculations use this view exclusively.
 
-### Problem 3: Date Arithmetic & Month Ordering in SQLite
-- **Issue**: The input dates were formatted as strings in European format (`DD-MM-YYYY`, e.g. `03-01-2026`). In SQLite, alphabetical sorting on `DD-MM-YYYY` results in chronological sorting errors (e.g. `01-03-2026` sorting before `02-02-2026`).
-- **Diagnosis**: Running `ORDER BY order_date` resulted in incorrect monthly trends.
-- **Resolution**: Normalised the dates during ETL into standard ISO-8601 `YYYY-MM-DD` and added a pre-computed `year_month` column (`YYYY-MM`) with index. This enabled clean SQL aggregations (`GROUP BY year_month ORDER BY year_month ASC`).
+### Problem 3: Date Sorting in SQLite
+- **Issue**: European `DD-MM-YYYY` strings sort incorrectly alphabetically.
+- **Resolution**: ETL converts to ISO `YYYY-MM-DD`; pre-computed `year_month` column (`YYYY-MM`) added for GROUP BY.
 
-### Problem 4: SQL Injection & Destructive Query Protection
-- **Issue**: Pure LLM text-to-SQL is susceptible to prompt injection, hallucinated tables, or destructive commands (`DROP TABLE`, `UPDATE`, `DELETE`).
-- **Diagnosis**: Testing stacked queries (`SELECT ...; DROP TABLE ...`) showed naive regex checks could be bypassed.
-- **Resolution**: Implemented a defense-in-depth security layer:
-  1. AST parsing via `sqlparse` verifying single `SELECT` statements.
-  2. Keyword blacklist for destructive operations.
-  3. Table whitelisting (`ALLOWED_TABLES`).
-  4. SQLite engine-level lock: `PRAGMA query_only = ON;`.
+### Problem 4: No LLM at Runtime (found during upgrade)
+- **Issue**: The original `config.py` had `GEMINI_API_KEY` and `OPENAI_API_KEY` — neither was wired to any real API call. The LLM was not actually invoked.
+- **Diagnosis**: Code audit showed `llm_client.py` did not exist; the agent was purely deterministic.
+- **Resolution**: Wrote `src/llm_client.py` using the `google-genai` SDK. The LLM now runs for unknown question types when a key is present.
+
+### Problem 5: SQL Validator Bypass (found during upgrade)
+- **Issue**: The original `database.execute_query()` called the DB directly without validation. Deterministic benchmark queries bypassed `SQLValidator`.
+- **Diagnosis**: `git grep validate_and_sanitize` showed it was only called inside `agent.py` for the LLM path — not for the 5 engine methods.
+- **Resolution**: Added `SQLValidator.validate_and_sanitize()` as a choke point inside `DatabaseManager.execute_query()`. All SQL now passes through it regardless of source.
+
+### Problem 6: `.env` Not Ignored (found during upgrade)
+- **Issue**: `.gitignore` did not list `.env`, so a real API key could be committed.
+- **Resolution**: Added `.env`, `.env.*`, `!.env.example`, `.venv/` entries to `.gitignore`.
+
+### Problem 7: Retired Model Name in Docs
+- **Issue**: Documentation and config referenced `gemini-2.0-flash`, which is shut down.
+- **Diagnosis**: Checked [ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash); stable model is `gemini-3.6-flash`.
+- **Resolution**: Updated `LLM_MODEL` default in `config.py` and all documentation.
+
+### Problem 8: Documentation Inaccuracies
+- **Issues**: README claimed "AST-based parsing", "autonomous", "zero hallucination", "SOC2/HIPAA/ISO", and a full AWS deployment blueprint with a `deploy.yml` that does not exist.
+- **Resolution**: Rewrote README to describe the real system; shrunk `cloud_deployment_aws.md` to a future-work note; removed all unimplemented claims.
 
 ---
 
 ## 5. What Would Be Improved With Another Day of Work
 
-If allocated an additional day, the following enhancements would be prioritized:
-
-1. **Enterprise Cloud Deployment on AWS**:
-   - Containerize the application using Docker and deploy to **AWS Lambda** fronted by **Amazon API Gateway**.
-   - Connect **Amazon Lex** as a conversational bot and voice channel.
-   - Use **Amazon Bedrock (Claude 3.5 Sonnet)** with the Bedrock Converse API for zero-shot text-to-SQL on complex ad-hoc queries.
-   - Store transaction data as partitioned Apache Parquet files in **Amazon S3** and query them via **Amazon Athena**.
-
-2. **Vector Retrieval-Augmented Generation (RAG) for Business Metadata**:
-   - Embed schema documentation, KPI definitions, and business glossaries into a vector store (e.g. pgvector or Amazon OpenSearch).
-   - Enable the agent to answer definitional questions like *"How do we calculate net revenue vs gross revenue?"*.
-
-3. **Multi-Turn Conversational Memory**:
-   - Implement stateful session tracking with LangGraph checkpointers backed by Redis or Amazon DynamoDB.
-   - Allow follow-up contextual questions like *"Which region was second?"* or *"Break that down by channel"*.
-
-4. **Automated Anomaly Alerts & Push Notifications**:
-   - Implement statistical trend detection (e.g., flagging the 31.8% drop in revenue between May and June 2026).
-   - Integrate with AWS EventBridge and SNS to push real-time alerts to Slack or executive email.
-
-5. **Streaming Responses (SSE / WebSockets)**:
-   - Stream the agent's ReAct thoughts in real time as they occur to improve user perceived responsiveness.
+1. **Real multi-model LLM routing**: use the Gemini `function_calling` feature to let the model choose between the 5 deterministic tools and free SQL — cleaner than the keyword router.
+2. **Multi-turn memory**: stateful session with conversation history so follow-up questions like "Which region was second?" work correctly.
+3. **Streaming responses (SSE)**: stream the agent's ReAct trace in real time.
+4. **Larger dataset & more question types**: extend the router or replace it with embedding-based intent matching for broader coverage.
+5. **Cloud deployment**: containerise with Docker; deploy to AWS Lambda + Aurora Serverless + Bedrock (see `docs/cloud_deployment_aws.md` for the outline).

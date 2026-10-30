@@ -1,148 +1,151 @@
 # ⚡ Mini AI Business Intelligence Assistant
 
-An autonomous AI Business Intelligence Assistant that enables business users to query enterprise sales data using natural language and receive executive-grade answers supported by deterministic database queries, interactive visualizations, and complete reasoning transparency.
+A placement-project Business Intelligence assistant: ask a question in plain English, get an answer backed by verified SQL, with interactive charts and a full reasoning trace.
 
 ---
 
-## 🌟 Key Features
+## 🌟 How It Works
 
-- **Autonomous ReAct Agent Loop**: Follows an explicit multi-step cycle (*Thought → Action → Observation → Synthesis*) for verifiable decision-making.
-- **Deterministic Analytics Engine**: Zero hallucination risk — all answers and KPIs are calculated directly from verified database query results.
-- **Zero-Trust SQL Security & Guardrails**:
-  - AST-based parsing and token inspection with `sqlparse`.
-  - Blocks all destructive statements (`DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, etc.).
-  - Rejects multi-statement / stacked SQL injection attempts.
-  - Whitelists permissible schema entities (`sales_transactions`, `v_completed_sales`, `data_quality_audit`).
-  - **Database Engine Lock**: Automatically sets `PRAGMA query_only = ON` on all SQLite analytical connections.
-- **Data Quality & ETL Pipeline**:
-  - Automatically identifies missing unit prices (e.g. `TXN0051`) and imputes them via product catalog pricing.
-  - Identifies and flags zero-quantity orders (e.g. `TXN0034`).
-  - Distinguishes returned orders (e.g. `TXN0033`) from realized revenue.
-  - Logs all anomalies with audit timestamps into a dedicated `data_quality_audit` table.
-- **Interactive Modern UI & REST API**:
-  - Executive KPI cards, Chart.js dynamic visual charts, quick-query chips, and structured tabular data views.
-  - Full visibility into executed SQL and step-by-step agent reasoning traces.
-- **Enterprise Cloud-Ready**:
-  - Designed to easily deploy as a serverless service on AWS (AWS Lambda + Amazon Bedrock / SageMaker + Amazon Lex + Amazon S3).
+The assistant uses a **keyword router + Gemini LLM** approach:
+
+- **Known question types** (total revenue, top product, monthly trend, top region, month-to-month change, category, channel, discount, returns, data quality) route directly to **verified deterministic SQL** — the answer is always exact.
+- **Unknown question types** go to the **Gemini LLM** (`gemini-3.6-flash` via `LLM_MODEL` in `.env`), which generates a SQL query. That SQL is validated by a token-level `sqlparse` choke point before any execution — destructive statements are blocked regardless of source.
+- If the LLM is unavailable or the question is outside sales data, a clear "I can't answer that" is returned.
+
+### Security layers (in order)
+1. `max_length=500` on the question → HTTP 422 if exceeded
+2. Regex attack-pattern guard on the question *text* (blocks `DROP TABLE`, `DELETE FROM`, etc. in the question itself)
+3. Keyword out-of-domain guard for obvious non-sales questions
+4. LLM `OUT_OF_SCOPE` sentinel → `status: out_of_domain`
+5. `SQLValidator.validate_and_sanitize` in `database.execute_query` — **every** SQL statement passes through this, regardless of origin
+6. SQLite `PRAGMA query_only = ON` engine lock
 
 ---
 
-## 📊 Benchmark Business Questions & Exact Answers
+## 📊 Benchmark Questions & Exact Answers
 
-The assistant natively supports and resolves all 5 benchmark questions with exact figures:
-
-| # | Question | Exact Answer | Executed SQL / Calculation |
-| :--- | :--- | :--- | :--- |
-| **Q1** | **What is the total revenue?** | **$1,445,200.00** Net Revenue (Gross: $1,449,700.00, Discounts: $4,500.00 across 50 completed orders). | `SELECT SUM(net_revenue) AS total_revenue FROM v_completed_sales;` |
-| **Q2** | **Which product generated the highest revenue?** | **Monitor** generated **$473,000.00** net revenue (50 units sold). Followed by Desk ($222,500.00) and Office Chair ($210,600.00). | `SELECT product, SUM(net_revenue) as rev FROM v_completed_sales GROUP BY product ORDER BY rev DESC;` |
-| **Q3** | **What is the monthly revenue trend?** | Revenue grew from **$210,250.00** (Jan 2026) to a peak of **$318,500.00** (May 2026, +32.3% MoM) before closing at **$217,250.00** (June 2026). | `SELECT year_month, SUM(net_revenue) FROM v_completed_sales GROUP BY year_month ORDER BY year_month ASC;` |
-| **Q4** | **Which region generated the highest sales?** | **South** region generated **$411,200.00** (28.5% of total sales). Followed by North ($384,450.00), East ($352,700.00), and West ($296,850.00). | `SELECT region, SUM(net_revenue) FROM v_completed_sales GROUP BY region ORDER BY rev DESC;` |
-| **Q5** | **How did revenue change between two months?** | Between January 2026 ($210,250.00) and February 2026 ($234,600.00), revenue **increased by +$24,350.00 (+11.58%)**. | `SELECT year_month, SUM(net_revenue) FROM v_completed_sales WHERE year_month IN ('2026-01', '2026-02') GROUP BY year_month;` |
+| # | Question | Answer |
+|---|---|---|
+| Q1 | What is the total revenue? | **$1,445,200.00** net (50 completed orders) |
+| Q2 | Which product generated the highest revenue? | **Monitor** — $473,000.00 |
+| Q3 | What is the monthly revenue trend? | Jan $210,250 → peak May $318,500 → Jun $217,250 |
+| Q4 | Which region generated the highest sales? | **South** — $411,200.00 |
+| Q5 | How did revenue change between January and February? | **+$24,350.00 (+11.58%)** |
 
 ---
 
-## 🏗️ Project Architecture
+## 🏗️ Project Structure
 
 ```
 mini_bi_assistant/
-│
 ├── data/
 │   ├── raw/sales_data.csv          # Raw 51 sales transaction records
 │   ├── processed/sales.db          # Cleaned SQLite database with indexes & views
-│   └── data_dictionary.md          # Comprehensive schema & column documentation
+│   └── data_dictionary.md
 │
 ├── src/
-│   ├── config.py                   # App configuration, catalog pricing & paths
-│   ├── database.py                 # SQLite connection manager & query_only safety pragma
-│   ├── sql_validator.py            # AST & regex safety validator (read-only, whitelist)
-│   ├── etl.py                      # Data ingestion, cleaning, imputation & audit logging
-│   ├── analytical_engine.py        # Deterministic analytics calculations & intent router
-│   ├── agent.py                    # ReAct loop coordinator (Thought -> Action -> Observation)
-│   └── api.py                      # FastAPI REST application & static file server
+│   ├── config.py                   # Paths, catalog prices, LLM settings (loads .env)
+│   ├── database.py                 # SQLite manager — validate_and_sanitize choke point here
+│   ├── sql_validator.py            # Token-level validation via sqlparse
+│   ├── etl.py                      # Ingestion, cleaning, imputation, audit logging
+│   ├── analytical_engine.py        # Deterministic queries & keyword intent router
+│   ├── llm_client.py               # google-genai SDK wrapper (gemini-3.6-flash)
+│   ├── agent.py                    # ReAct loop: guards → router → LLM → deterministic
+│   └── api.py                      # FastAPI REST app & static file server
 │
-├── static/
-│   ├── index.html                  # Responsive executive BI dashboard UI
-│   ├── style.css                   # Modern dark-mode UI styling
-│   └── app.js                      # Chart.js visualization, KPI loader & table renderer
-│
-├── tests/
-│   ├── test_etl.py                 # Data loading, missing prices, returns, zero qty
-│   ├── test_sql_validator.py       # Security checks (blocks DROP, DELETE, injection)
-│   ├── test_analytics.py           # Verification of 5 benchmark analytical questions
-│   ├── test_agent.py               # ReAct cycle, edge cases & guardrails
-│   └── test_api.py                 # FastAPI endpoints (/health, /api/kpis, /api/query)
-│
-├── docs/
-│   ├── architecture.md             # System architecture & Mermaid sequence diagrams
-│   └── cloud_deployment_aws.md     # AWS Serverless & Agentic AI deployment blueprint
-│
-├── requirements.txt                # Pinned dependencies
-├── run.py                          # 1-command startup script
-├── REPORT.md                       # Comprehensive project report & AI usage retrospective
-└── README.md                       # Documentation
+├── static/                         # Web UI (HTML/CSS/JS + Chart.js)
+├── tests/                          # 59 automated tests
+├── docs/                           # Architecture & future cloud notes
+├── .env.example                    # Copy this to .env and add your API key
+├── requirements.txt
+├── run.py
+├── REPORT.md
+└── README.md
 ```
 
 ---
 
-## 🚀 Quickstart & Execution
+## 🚀 Quickstart
 
 ### 1. Prerequisites
-- Python 3.10+ (Tested on Python 3.13)
-- `git`
+- Python 3.10+ (tested on 3.13)
 
 ### 2. Installation
 ```bash
-# Clone the repository
 git clone <repo-url>
-cd mini_bi_assistant
+cd AI_BI_Assistant
 
-# Create and activate a virtual environment
 python -m venv venv
-# On Windows:
+# Windows:
 venv\Scripts\activate
-# On Linux/macOS:
+# Linux/macOS:
 source venv/bin/activate
 
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 3. Launch the Application (1-Command)
+### 3. Set up your API key (optional — app works without one)
+```bash
+copy .env.example .env        # Windows
+# or: cp .env.example .env   # Linux/macOS
+```
+
+Open `.env` and set:
+```
+GOOGLE_API_KEY=your-key-here
+```
+
+> ⚠️ **Never commit `.env`** — it is already in `.gitignore`.  
+> Without a key, the assistant runs in deterministic-only mode and answers all known question types correctly. Only truly ad-hoc/unknown questions need the LLM.
+
+### 4. Launch
 ```bash
 python run.py
 ```
-This automatically runs the ETL pipeline (if not already built) and launches the server.
-
-- **Web Dashboard**: Open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser.
-- **Interactive Swagger API Docs**: Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
+- Web Dashboard: [http://127.0.0.1:8000](http://127.0.0.1:8000)
+- Swagger API Docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 
 ---
 
-## 🧪 Running Automated Tests
-
-Run the full automated test suite (33 test cases covering ETL, SQL validation, analytics, agent logic, and REST API):
+## 🧪 Running Tests
 
 ```bash
-pytest -v
+python -m pytest -q
 ```
 
-Output:
-```
-tests/test_agent.py ................ PASSED
-tests/test_analytics.py ............. PASSED
-tests/test_api.py ................... PASSED
-tests/test_etl.py ................... PASSED
-tests/test_sql_validator.py ......... PASSED
-======================== 33 passed in 3.81s ========================
-```
+59 tests — ETL, SQL validation, analytics benchmarks, agent logic, REST API, LLM guardrails.
+
+---
+
+## 🗄️ How Data Is Stored and Queried
+
+1. **ETL** (`src/etl.py`): reads `sales_data.csv` (51 rows), normalises dates from `DD-MM-YYYY` to `ISO 8601`, imputes 1 missing unit price from catalog, flags zero-quantity and returned orders, logs all decisions to `data_quality_audit`.
+2. **SQLite database** (`data/processed/sales.db`):
+   - `sales_transactions` — raw and cleaned data with `is_imputed` flag
+   - `v_completed_sales` — view filtering `WHERE status = 'Completed'`; used for **all** revenue calculations
+   - `data_quality_audit` — one row per anomaly detected during ETL
+   - Indexes on `product`, `region`, `year_month` for fast GROUP BY queries
+3. **Query execution**: every SQL statement — whether from the deterministic engine, the LLM, or an exploratory branch — goes through `database.execute_query()`, which calls `SQLValidator.validate_and_sanitize()` before touching SQLite. The connection also has `PRAGMA query_only = ON`.
 
 ---
 
 ## 🛡️ Data Quality & Anomaly Handling
 
-During ingestion, the pipeline detected and handled 3 distinct data quality issues:
-1. **Missing Unit Price (`TXN0051`)**: Order date 28-06-2026 had an empty unit price for `Laptop Stand`. The pipeline looked up the product's catalog price ($1,200.00), imputed the value, set `is_imputed = 1`, and logged the audit trail.
-2. **Zero Quantity Order (`TXN0034`)**: Order for `Keyboard` had `Quantity = 0`. Net revenue calculated as $0.00 and flagged as `ZERO_QUANTITY`.
-3. **Returned Order (`TXN0033`)**: Order for `Monitor` (2 units, $19,000) was marked as `Status = 'Returned'`. Flagged as `RETURNED_ORDER` and excluded from the realized revenue view `v_completed_sales`.
+| Issue | Record | Action |
+|---|---|---|
+| Missing unit price | TXN0051 — Laptop Stand | Imputed $1,200 from catalog; `is_imputed=1` |
+| Zero quantity | TXN0034 — Keyboard | Flagged `ZERO_QUANTITY`; $0 revenue |
+| Returned order | TXN0033 — Monitor 2 units | Flagged `RETURNED_ORDER`; excluded from `v_completed_sales` |
 
-All actions are transparently auditable via `GET /api/data-quality`.
+Audit trail available at `GET /api/data-quality`.
+
+---
+
+## ⚠️ Known Limitations
+
+- **Small dataset**: 51 rows, 50 completed orders. Results are exact for this dataset but not statistically significant.
+- **Completed orders only**: only `status = 'Completed'` rows count as revenue. Returned and zero-quantity records are excluded.
+- **Known question types only (without key)**: without a Gemini API key the assistant only answers the named question categories listed above. Truly ad-hoc questions return "I can't answer that."
+- **LLM SQL not guaranteed**: the LLM generates SQL that satisfies the rules most of the time, but its output is validated and all rows are always shown alongside the answer so you can verify it.
+- **No multi-turn memory**: each question is answered independently; there is no session context.
+- **Keyword router coverage**: the intent router recognises the 5 benchmark questions and ~7 exploratory categories by keyword. New question types require either a Gemini key or extending the router.
