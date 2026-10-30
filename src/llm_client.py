@@ -58,6 +58,8 @@ RULES
    ALTER, TRUNCATE, or any DDL/DML.
 4. Only reference these tables/views: v_completed_sales, sales_transactions,
    data_quality_audit.
+5. If the question is not about sales data (e.g. weather, geography, sports,
+   general knowledge), respond with exactly: OUT_OF_SCOPE
 
 EXAMPLES
 --------
@@ -109,6 +111,10 @@ class LLMClient:
         LLMGenerationError on any API / network / timeout error.
         """
         user_prompt = f"Generate a SQL query for this question: {question}"
+        # fix #2: append the error hint from a previous failed attempt
+        # The schema is always in the system prompt, so schema_context only carries the error.
+        if schema_context:
+            user_prompt += f"\n\nNote from previous attempt: {schema_context}"
 
         try:
             response = self._client.models.generate_content(
