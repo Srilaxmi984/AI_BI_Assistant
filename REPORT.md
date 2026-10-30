@@ -8,7 +8,9 @@ This report documents the architectural decisions, development methodology, prob
 
 ## 2. Which AI Tools Were Used
 
-[DEV_TOOLS_USED]
+**Development AI tooling:**
+- **Antigravity (powered by Google Gemini)** — primary pair-programming assistant used throughout. Used for planning, code generation (ETL, agent, LLM client, test suites), iterative debugging, doc writing, and all structured code review. All generated code was reviewed and understood before committing.
+- **Google AI Studio** — used to test prompt designs for the `gemini-3.6-flash` system prompt (text-to-SQL rules, OUT_OF_SCOPE sentinel, schema context).
 
 **Runtime AI tooling:**
 - **`google-genai` SDK** — the official Google Gen AI Python SDK, used at runtime to call `gemini-3.6-flash` (configured via `LLM_MODEL` in `.env`). This model is the current stable Flash generation as documented at [ai.google.dev](https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash).

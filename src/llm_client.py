@@ -124,7 +124,8 @@ class LLMClient:
                     system_instruction=_SYSTEM_PROMPT,
                     temperature=0.0,          # deterministic output
                     max_output_tokens=512,
-                    timeout=_TIMEOUT_SECONDS,
+                    # Note: timeout is handled at the HTTP transport level,
+                    # not via GenerateContentConfig in the current SDK version.
                 ),
             )
             raw = response.text or ""
