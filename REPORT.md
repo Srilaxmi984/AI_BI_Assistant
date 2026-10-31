@@ -4,7 +4,7 @@
 
 The Mini AI Business Intelligence Assistant answers sales questions in plain English. Known questions use verified SQL. Other questions go to Gemini, which writes one SELECT that is validated and run on a read-only database. The answer text is always built by Python from the returned rows, and the SQL, rows and reasoning trace are shown to the user.
 
-What works: all five benchmark questions with exact figures, data cleaning with an audit log, a validated and read-only query path, a Gemini text-to-SQL path with retry and fallback, a REST API, a dashboard, and 59 automated tests.
+What works: all five benchmark questions with exact figures, data cleaning with an audit log, a validated and read-only query path, a Gemini text-to-SQL path with retry and fallback, a REST API, a dashboard, and 78 automated tests.
 
 What is limited: a 51-row dataset, a keyword router for known questions, no multi-turn memory, and token-level SQL validation. See "Known Limitations" in the README.
 
@@ -12,8 +12,12 @@ What is limited: a 51-row dataset, a keyword router for known questions, no mult
 
 **During development**
 
-- **Antigravity (powered by Google Gemini)** — primary pair-programming assistant used throughout the project. Used for planning, generating code (ETL, agent, LLM client, API, UI, test suites), iterative debugging, and all structured code review. All generated code was reviewed and run against the tests before being committed.
-- **Google AI Studio** — used to test and iterate on the `gemini-3.6-flash` system prompt design (text-to-SQL rules, OUT_OF_SCOPE sentinel, schema context, retry behaviour).
+[DEV_TOOLS_USED]
+
+<!-- Replace the line above with what you really used, for example:
+- Antigravity (model: ...) for generating and editing code and tests
+- Claude (claude.ai) for reviewing the code and planning fixes
+Do not list tools you did not use. -->
 
 **At runtime**
 
@@ -45,8 +49,10 @@ Every AI-written piece was run against the tests and the five known answers befo
 | 9 | A malicious question like "DROP TABLE ..." received a normal-looking answer | Reading the agent paths | Attack-pattern guard rejects it with status `rejected`; the pattern list avoids plain words so "revenue update for May" still works |
 | 10 | Documentation claimed things that did not exist (a deploy workflow, wrong test counts, "AST-based", "zero hallucination", compliance claims, tools not used) | Comparing every claim in the docs with the code | Rewrote the docs to describe only what is implemented |
 | 11 | `pytest` failed with "No module named src" | Bare `pytest` does not add the project folder to the import path | Added `pytest.ini` with `pythonpath = .` |
-| 12 | Model-written SQL gives results of any shape | Design review | A generic Python formatter builds the answer, table and chart type from the columns; money formatting depends on the column name |
-| 13 | **`timeout` field rejected by `GenerateContentConfig`** | Running the agent directly showed a Pydantic validation error in `llm_client.py` | Removed `timeout` from `GenerateContentConfig`; the SDK handles transport-level timeouts automatically |
+| 12 | Questions with a filter were answered as if the filter was not there (for example "highest sales region in March" returned the all-time answer) | Reading how the router matched keywords | Added `breakdown.py`: filters and rankings are parsed into a small spec and run as verified SQL; tests check that regional figures for a month add up to that month's revenue |
+| 13 | Ordinary words were read as months ("market" contains "mar", "may" is a common word, "1" is a digit) | Reviewing the month matching in `detect_intent` | Months are matched as whole words only, "may" only where it clearly means the month, and a month outside the data gets a "no sales data" answer |
+| 14 | Numbers and names were typed into answer text (a "+32.3%" growth month and a fixed list of region names) | Reading the answer strings in `analytical_engine.py` | Those parts are now computed from the returned rows |
+| 15 | Model-written SQL gives results of any shape | Design review | A generic Python formatter builds the answer, table and chart type from the columns; money formatting depends on the column name |
 
 Debugging approach: reproduce with a failing test or a direct query, fix the cause, and add a test so it cannot return. The five benchmark figures were re-checked after every change.
 

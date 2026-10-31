@@ -325,6 +325,11 @@ class SalesBIAgent:
             steps.append({"step": "Observation",
                           "detail": f"Change: {result['supporting_figures']['direction']} "
                                     f"${abs(result['supporting_figures']['absolute_change']):,.2f}"})
+        elif intent == "breakdown":
+            spec = params["spec"]
+            steps.append({"step": "Action", "detail": f"Deterministic: verified breakdown (measure={spec.metric}, group by={spec.dimension}, filters={spec.filters})"})
+            result = self.analytical_engine.breakdown.run(spec)
+            steps.append({"step": "Observation", "detail": f"{len(result.get('table_data', []))} row(s) returned."})
 
         else:
             # Named exploratory SQL branches — guaranteed to have a keyword match

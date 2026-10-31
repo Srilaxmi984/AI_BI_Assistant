@@ -26,7 +26,7 @@ flowchart TD
     G3 -->|yes| Refuse
 
     G3 -->|no| Router{Known intent?}
-    Router -->|yes| Engine[Verified engine analytical_engine.py]
+    Router -->|yes| Engine[Verified engine: analytical_engine.py and breakdown.py]
     Router -->|no| LLM[Gemini llm_client.py writes one SELECT]
     LLM -->|SQL fails validation twice, or LLM error, or no key| Fallback[Exploratory SQL or cannot answer]
 
@@ -41,8 +41,6 @@ flowchart TD
     RO -->|rows| Build[Python builds answer, table and chart]
     Build -->|JSON with mode| UI
 ```
-
----
 
 ## 2. Request flow
 
@@ -86,8 +84,6 @@ sequenceDiagram
     UI-->>U: answer, chart, table, SQL and trace
 ```
 
----
-
 ## 3. Components
 
 | File | Role |
@@ -95,19 +91,16 @@ sequenceDiagram
 | `src/etl.py` | Loads the CSV, normalises dates, imputes the missing price, flags returns and zero quantity, writes the audit log |
 | `src/database.py` | Opens read-only connections and validates every query before it runs |
 | `src/sql_validator.py` | Token-level validation with `sqlparse`, table whitelist, `LIMIT` enforcement |
-| `src/analytical_engine.py` | Intent detection and the verified SQL for known questions |
-| `src/llm_client.py` | Calls Gemini through the `google-genai` SDK; strips code fences; `OUT_OF_SCOPE` detection |
+| `src/analytical_engine.py` | Intent detection and the verified SQL for the five benchmark questions |
+| `src/breakdown.py` | Verified SQL for filtered, ranked and grouped questions; filter values are matched against values in the database and SQL comes from fixed templates |
+| `src/llm_client.py` | Calls Gemini through the `google-genai` SDK; 15 second timeout; strips code fences |
 | `src/agent.py` | Guards, routing between engine and Gemini, retry and fallback, answer formatting |
 | `src/api.py` | HTTP endpoints, request limits, response model |
 | `static/` | Dashboard: KPI cards, Chart.js chart, data table, SQL and trace panel |
 
----
-
 ## 4. Why two paths
 
-Known questions use fixed SQL, so their answers are exact and repeatable. The five benchmark answers always come from this path. Gemini adds flexibility for other questions, but its SQL cannot be trusted blindly, so it is validated, run read-only, and displayed for checking. If anything goes wrong, the system degrades to the verified engine or a clear "cannot answer" message, never to a made-up answer.
-
----
+Known questions use fixed SQL, so their answers are exact and repeatable. The five benchmark answers always come from this path, and so do filtered, ranked and grouped questions such as "top 3 regions" or "units sold per product", whose SQL is built from fixed templates. Gemini adds flexibility for other questions, but its SQL cannot be trusted blindly, so it is validated, run read-only, and displayed for checking. If anything goes wrong, the system degrades to the verified engine or a clear "cannot answer" message, never to a made-up answer.
 
 ## 5. Defense in depth
 
@@ -115,8 +108,6 @@ Known questions use fixed SQL, so their answers are exact and repeatable. The fi
 2. **Validator**: one statement, SELECT only, write and admin keywords blocked, tables limited to `sales_transactions`, `v_completed_sales`, `data_quality_audit`, and `LIMIT 1000` added if missing.
 3. **Engine lock**: connections use `PRAGMA query_only = ON`, so even a missed case cannot change data.
 4. **Output**: numbers come from Python formatting of returned rows, never from model text.
-
----
 
 ## 6. Preventing wrong or unsupported answers
 
@@ -128,8 +119,6 @@ Known questions use fixed SQL, so their answers are exact and repeatable. The fi
 | Off-topic question | Keyword guard plus the model's `OUT_OF_SCOPE` reply |
 | Model unavailable, bad key, retired model | Falls back to the verified engine or says it cannot answer |
 | User cannot judge the answer | SQL, rows, mode and reasoning trace are always returned |
-
----
 
 ## 7. Mapping to common agent frameworks
 

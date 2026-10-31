@@ -12,7 +12,7 @@ The app uses two paths, and the response always says which one was used in its `
 
 | Path | When | `mode` |
 |---|---|---|
-| **Verified engine** | Known question types: total revenue, top product, monthly trend, top region, change between two months, plus a few exploratory ones (category, channel, discounts, returns, data quality, average order value, units) | `deterministic` |
+| **Verified engine** | Known question types: the five benchmark questions, filtered and ranked questions (see the next section), plus a few exploratory ones (category, channel, discounts, returns, data quality, average order value, units) | `deterministic` |
 | **Gemini text-to-SQL** | Business questions the router does not recognise | `llm` |
 | **Refused** | Empty, too long, SQL-attack patterns, out of domain, or unanswerable | `none` |
 
@@ -23,7 +23,26 @@ How the Gemini path works:
 3. The answer text is built by **Python from the returned rows**. The model never writes the numbers.
 4. If validation fails, the app retries once, feeding the error back to the model. If that also fails, or there is no API key, or the model errors, it falls back to the verified engine or says it cannot answer.
 
-The app works without an API key: the verified engine handles all benchmark questions.
+The app works without an API key: the verified engine handles all benchmark questions and the question types listed below.
+
+Example of a question that goes to Gemini because the verified engine does not cover it: *"What percentage of completed orders had a discount?"*
+
+---
+
+## Questions the verified engine answers (no API key needed)
+
+Besides the five benchmark questions, `src/breakdown.py` answers questions built from these parts:
+
+| Part | Examples |
+|---|---|
+| Measure | revenue, units sold, number of orders, average order value, discounts |
+| Grouping | by product, category, region, sales channel or month |
+| Filter | a month (`in March`), region (`South`), product (`Monitor`), category or channel |
+| Ranking | `top 3`, `bottom 2`, `highest`, `lowest`, `fewest`, `most` |
+
+Examples: *"What was the revenue in January?"*, *"Top 3 regions by revenue"*, *"Which region has the lowest revenue?"*, *"How many units were sold per product?"*, *"Number of orders per region"*, *"Revenue by region in March"*, *"What is the revenue of Monitor?"*, *"Which month had the highest revenue?"*.
+
+How it stays safe and exact: filter values are matched against values that exist in the database, and the SQL is built from fixed templates, so no text from the question is ever placed into a query. A month outside the data (for example July) gets a clear "no sales data" answer. Questions that combine two groupings (for example "by product and region") are passed to Gemini.
 
 ---
 
@@ -54,12 +73,13 @@ AI_BI_Assistant/
 │   ├── database.py                # SQLite access; validates every query (single choke point)
 │   ├── sql_validator.py           # Token-level SQL validation with sqlparse
 │   ├── etl.py                     # CSV load, cleaning, imputation, audit log
-│   ├── analytical_engine.py       # Intent router and verified SQL for known questions
+│   ├── analytical_engine.py       # Intent router and verified SQL for the benchmark questions
+│   ├── breakdown.py               # Verified SQL for filtered, ranked and grouped questions
 │   ├── llm_client.py              # Gemini client (google-genai)
 │   ├── agent.py                   # Guards, routing, LLM path, answer building
 │   └── api.py                     # FastAPI app and static file server
 ├── static/                        # index.html, style.css, app.js (Chart.js UI)
-├── tests/                         # pytest suite (LLM is always mocked)
+├── tests/                         # pytest suite (LLM is always mocked); test_breakdown.py covers the flexible questions
 ├── docs/
 │   ├── architecture.md            # Diagrams and design explanation
 │   └── cloud_deployment_aws.md    # Future work note (not implemented)
@@ -162,12 +182,13 @@ python run.py
 python -m pytest -q
 ```
 
-The suite has **59 tests** covering ETL, the SQL validator, the five benchmark answers, the agent and its guards, the REST API, and the LLM path.
+The suite has **78 tests** covering ETL, the SQL validator, the five benchmark answers, the filtered and ranked questions, the agent and its guards, the REST API, and the LLM path.
 
 - The LLM is **mocked** in every test, so no API key or network is needed.
 - Valid questions: all five benchmark answers are asserted to the exact figure.
 - Invalid and malicious input: empty question, a 501-character question (HTTP 422), `DROP TABLE` in the question text, stacked queries, destructive SQL returned by a mocked model.
-- Edge cases: out-of-domain questions, model failure with fallback, no API key, "show me the revenue update for May" (the word "update" must not trigger a rejection), and a check that SQL from the model is validated before it runs.
+- Filtered and ranked questions: top N, lowest, per-group units and orders, month filters, a month with no data, and checks that the groups add up to the totals.
+- Edge cases: out-of-domain questions, ordinary words such as "market" not being read as months, model failure with fallback, no API key, "show me the revenue update for May" (the word "update" must not trigger a rejection), and a check that SQL from the model is validated before it runs.
 
 ---
 
@@ -213,7 +234,7 @@ Preventing wrong answers: numbers in answers are computed or formatted by Python
 
 - The dataset is small (51 rows), so results demonstrate the design, not scale.
 - Only completed orders count as revenue; the returned order is excluded.
-- The keyword router recognises a limited set of question types; anything else depends on the Gemini path.
+- The verified engine recognises a limited set of question types (the benchmark questions and the filter, ranking and grouping combinations listed above); anything else depends on the Gemini path. Without an API key, other questions get a clear "cannot answer" message.
 - SQL written by the model is not guaranteed to match what the user meant, which is why the SQL and rows are always displayed.
 - There is no multi-turn memory: each question is answered on its own.
 - Out-of-domain detection uses a keyword list plus the model's own refusal, so unusual off-topic questions can slip through to the model path.

@@ -1,6 +1,7 @@
 import re
 from typing import Dict, Any, List, Optional, Tuple
 from src.database import DatabaseManager
+from src.breakdown import BreakdownEngine
 
 class AnalyticalEngine:
     """
@@ -19,6 +20,8 @@ class AnalyticalEngine:
 
     def __init__(self, db_manager: Optional[DatabaseManager] = None):
         self.db = db_manager or DatabaseManager()
+        # Flexible verified questions: filters, top/bottom N, per-group units/orders
+        self.breakdown = BreakdownEngine(self.db)
 
     def get_total_revenue(self) -> Dict[str, Any]:
         """Q1: What is the total revenue?"""
@@ -78,10 +81,13 @@ class AnalyticalEngine:
             return {"error": "No sales data found."}
 
         top_product = rows[0]
+        # Runners-up come from the data (works with any number of products)
+        runners = [f"{r['product']} (${r['total_revenue']:,.2f})" for r in rows[1:3]]
+        followed = f" It was followed by {' and '.join(runners)}." if runners else ""
         answer = (
             f"The product with the highest revenue is **{top_product['product']}** ({top_product['category']}), "
-            f"generating **${top_product['total_revenue']:,.2f}** net revenue from {top_product['total_units_sold']} units sold. "
-            f"It was followed by {rows[1]['product']} (${rows[1]['total_revenue']:,.2f}) and {rows[2]['product']} (${rows[2]['total_revenue']:,.2f})."
+            f"generating **${top_product['total_revenue']:,.2f}** net revenue from {top_product['total_units_sold']} units sold."
+            f"{followed}"
         )
 
         return {
@@ -144,11 +150,21 @@ class AnalyticalEngine:
         peak_month = max(rows, key=lambda x: x["monthly_revenue"])
         trough_month = min(rows, key=lambda x: x["monthly_revenue"])
 
+        # The strongest-growth month is computed from the data, not typed in
+        growth_note = ""
+        if len(trend_details) > 1:
+            best = max(trend_details[1:], key=lambda t: t["pct_change"])
+            if best["pct_change"] > 0:
+                growth_note = (
+                    f" The strongest growth month was {best['month']} "
+                    f"({best['pct_change']:+.1f}% vs the previous month)."
+                )
+
         answer = (
             f"Monthly revenue grew from **${rows[0]['monthly_revenue']:,.2f}** in {rows[0]['year_month']} "
             f"to a peak of **${peak_month['monthly_revenue']:,.2f}** in {peak_month['year_month']}, "
-            f"before adjusting to **${rows[-1]['monthly_revenue']:,.2f}** in {rows[-1]['year_month']}. "
-            f"The strongest growth month was May 2026 (+32.3% MoM)."
+            f"before adjusting to **${rows[-1]['monthly_revenue']:,.2f}** in {rows[-1]['year_month']}."
+            f"{growth_note}"
         )
 
         return {
@@ -192,13 +208,18 @@ class AnalyticalEngine:
         total_all_regions = sum(r["total_revenue"] for r in rows)
         top_share = (top_region["total_revenue"] / total_all_regions) * 100 if total_all_regions else 0
 
+        # Region names and order come from the data, not from fixed positions
+        parts = [f"{r['region']} (${r['total_revenue']:,.2f})" for r in rows]
+        if len(parts) > 2:
+            parts[-1] = "and " + parts[-1]
+            breakdown_text = ", ".join(parts)
+        else:
+            breakdown_text = " and ".join(parts)
+
         answer = (
             f"The **{top_region['region']}** region generated the highest sales with **${top_region['total_revenue']:,.2f}** "
             f"({top_share:.1f}% of total company revenue across {top_region['total_units_sold']} units sold). "
-            f"Regional breakdown: South (${rows[0]['total_revenue']:,.2f}), "
-            f"North (${rows[1]['total_revenue']:,.2f}), "
-            f"East (${rows[2]['total_revenue']:,.2f}), "
-            f"and West (${rows[3]['total_revenue']:,.2f})."
+            f"Regional breakdown: {breakdown_text}."
         )
 
         return {
@@ -283,32 +304,41 @@ class AnalyticalEngine:
     def detect_intent(self, question: str) -> Tuple[str, Dict[str, Any]]:
         """
         Extracts intent and parameters from natural language input.
+
+        Order of decisions:
+          1. A month the data does not cover (e.g. July) -> clear "no data" answer.
+          2. "Change / compare" between months -> Q5.
+          3. Questions with filters, top/bottom N, or per-group units/orders -> breakdown.
+          4. Questions mixing several groupings -> unknown (goes to the LLM).
+          5. The four fixed benchmark phrasings.
         """
         q = question.lower().strip()
+        spec = self.breakdown.parse(q)
 
-        # Check for month-over-month / two months change
-        # E.g. "how did revenue change between january and february" or "revenue change between two months"
-        if ("change" in q or "differ" in q or "grow" in q or "compare" in q) and ("month" in q or any(m in q for m in self.MONTH_NAME_MAP)):
-            # Search for named months in the query
-            found_months = []
-            for token, ym in self.MONTH_NAME_MAP.items():
-                if re.search(r"\b" + re.escape(token) + r"\b", q):
-                    if ym not in found_months:
-                        found_months.append(ym)
-            if len(found_months) >= 2:
-                # Sort chronologically
-                found_months.sort()
-                return "revenue_change_between_months", {"m1": found_months[0], "m2": found_months[1]}
-            elif len(found_months) == 1:
-                # e.g., compare January with February
-                m1 = found_months[0]
+        # 1. months outside the data
+        if spec.missing_months:
+            return "breakdown", {"spec": spec}
+
+        # 2. month-over-month change (months are matched as whole words only)
+        months = spec.filters.get("month", [])
+        if any(w in q for w in ("change", "differ", "grow", "compare")) and (months or "month" in q):
+            if len(months) >= 2:
+                return "revenue_change_between_months", {"m1": months[0], "m2": months[1]}
+            if len(months) == 1:
+                m1 = months[0]
                 m2 = "2026-02" if m1 == "2026-01" else "2026-01"
                 return "revenue_change_between_months", {"m1": min(m1, m2), "m2": max(m1, m2)}
-            else:
-                return "revenue_change_between_months", {"m1": "2026-01", "m2": "2026-02"}
+            return "revenue_change_between_months", {"m1": "2026-01", "m2": "2026-02"}
 
+        # 3 and 4. flexible questions
+        if spec.multi_dimension:
+            return "unknown", {}
+        if self.breakdown.wants_breakdown(spec):
+            return "breakdown", {"spec": spec}
+
+        # 5. fixed benchmark phrasings
         # Total revenue
-        if ("total revenue" in q or "overall revenue" in q or "gross sales" in q or "how much revenue" in q or 
+        if ("total revenue" in q or "overall revenue" in q or "gross sales" in q or "how much revenue" in q or
             ("total" in q and "sales" in q and "region" not in q and "product" not in q)):
             return "total_revenue", {}
 
