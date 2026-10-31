@@ -6,14 +6,16 @@ Order of checks per question:
   2. Attack-pattern guard (SQL-injection sequences in the question text)
   3. Out-of-domain guard (known irrelevant keywords)
   4. LLM path (if key + LLM_ENABLED and intent=="unknown"):
-       a. LLM returns "OUT_OF_SCOPE" → out_of_domain, mode=none        [fix #5]
+       a. LLM returns "OUT_OF_SCOPE" → out_of_domain, mode=none
        b. LLM returns valid SQL → validate → execute → success, mode=llm
-       c. Retry once with the validation error appended                [fix #2]
+       c. Retry once with the validation error appended
        d. Retry fails → fall through
+     Whenever the LLM is skipped or fails, the reasoning trace says why.
   5. "Can't answer" gate: unknown intent + LLM unavailable + no named
-       exploratory keyword → clear "I can't answer" message, mode=none  [fix #4]
+       exploratory keyword (or a question that needs the LLM, such as a
+       percentage) → clear "I can't answer" message, mode=none
   6. Named exploratory SQL branches (category / channel / discount / …)
-  7. Deterministic engine for the 5 benchmarks
+  7. Deterministic engine (the 5 benchmarks and the breakdown engine)
 
 All SQL goes through database.execute_query() which calls
 SQLValidator.validate_and_sanitize — the single choke point.
@@ -58,6 +60,28 @@ _EXPLORATORY_KEYWORDS = frozenset({
     "invalid", "average", "aov", "unit", "quantity", "how many items",
 })
 
+# Questions the fixed exploratory branches cannot answer correctly (they would return
+# a different figure, e.g. total discounts for a "percentage of discounted orders" question).
+# Without the LLM these get a clear "cannot answer" instead of a wrong answer.
+_NEEDS_LLM_WORDS = ("percent", "percentage", "proportion", "ratio", "share of",
+                    "average discount", "avg discount", "discount per", "per discounted")
+
+
+def _llm_failure_reason(exc: Exception) -> str:
+    """Short, safe description of why a Gemini call failed (never repeats the raw error text)."""
+    text = str(exc).upper()
+    if "PERMISSION_DENIED" in text or " 403" in text:
+        return "Gemini refused the request (permission or billing problem with the API key's project)."
+    if "UNAUTHENTICATED" in text or " 401" in text or ("API KEY" in text and "NOT VALID" in text):
+        return "The API key was not accepted."
+    if "NOT_FOUND" in text or " 404" in text:
+        return "Model not found (check LLM_MODEL)."
+    if "RESOURCE_EXHAUSTED" in text or " 429" in text:
+        return "Gemini rate limit or quota reached."
+    if "TIMEOUT" in text or "TIMED OUT" in text or "DEADLINE" in text:
+        return "Gemini did not answer in time."
+    return "The Gemini call failed (details are in the server log)."
+
 
 class SalesBIAgent:
     """
@@ -67,7 +91,7 @@ class SalesBIAgent:
     def __init__(self, db_manager: Optional[DatabaseManager] = None):
         self.db = db_manager or DatabaseManager()
         self.analytical_engine = AnalyticalEngine(self.db)
-        self.validator = SQLValidator()   # instance used for fix #1
+        self.validator = SQLValidator()
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -149,11 +173,12 @@ class SalesBIAgent:
             if llm_result is not None:
                 return llm_result
 
-            # LLM unavailable / exhausted → check for named exploratory keywords
-            # before falling through.  [fix #4]
+            # LLM unavailable / exhausted → only answer if a fixed branch fits the question
             q_lower = q.lower()
-            if not any(w in q_lower for w in _EXPLORATORY_KEYWORDS):
-                steps.append({"step": "Fallback", "detail": "LLM unavailable and question not recognised."})
+            no_fixed_branch = not any(w in q_lower for w in _EXPLORATORY_KEYWORDS)
+            needs_llm = any(w in q_lower for w in _NEEDS_LLM_WORDS)
+            if no_fixed_branch or needs_llm:
+                steps.append({"step": "Fallback", "detail": "LLM unavailable and no verified query fits this question."})
                 return self._build_response(
                     question=q,
                     answer=(
@@ -169,12 +194,12 @@ class SalesBIAgent:
         # ── 6. Deterministic engine ───────────────────────────────────
         try:
             result, mode = self._run_deterministic(intent, params, q, steps, start_time)
-        except Exception as exc:
-            logger.exception("Deterministic engine error for question: %s", q)  # fix #6: log real exc
+        except Exception:
+            logger.exception("Deterministic engine error for question: %s", q)   # real error goes to the log only
             steps.append({"step": "Error", "detail": "Deterministic engine encountered an error."})
             return self._build_response(
                 question=q,
-                answer="An internal error occurred. Please try a different question.",  # fix #6: no raw exc
+                answer="An internal error occurred. Please try a different question.",
                 sql_query="", supporting_figures={}, table_data=[],
                 chart_type=None, chart_config=None,
                 steps=steps, status="error", mode="none", start_time=start_time,
@@ -200,36 +225,43 @@ class SalesBIAgent:
         """
         Attempt to answer via LLM text-to-SQL.
         Returns a full response dict on success, None if LLM is unavailable
-        or all retries are exhausted.
+        or all retries are exhausted. Every skip or failure adds a line to the
+        reasoning trace so the reason is visible in the UI.
         """
         try:
             from src.llm_client import LLMClient, LLMDisabledError, LLMGenerationError
         except ImportError:
+            steps.append({"step": "LLM", "detail": "Gemini library not installed (run: pip install -r requirements.txt)."})
             return None
 
         try:
             client = LLMClient()
+        except LLMDisabledError:
+            steps.append({"step": "LLM", "detail": "Gemini not used: no API key, or LLM_ENABLED=false."})
+            return None
         except Exception:
-            return None  # key missing / LLM disabled — silent fallback
+            logger.exception("Could not create the Gemini client")
+            steps.append({"step": "LLM", "detail": "Gemini client could not start (see the server log)."})
+            return None
 
         steps.append({"step": "Thought", "detail": "Unknown intent — attempting LLM text-to-SQL."})
 
-        last_error = ""   # fix #7: local variable, not a class attribute
+        last_error = ""
 
-        for attempt in range(1, 3):   # max 2 attempts (1 retry with error appended)
-            # fix #2: append error hint on retry; schema always lives in system prompt
+        for attempt in range(1, 3):   # max 2 attempts (1 retry with the error appended)
+            # the schema always lives in the system prompt; only the error is added on retry
             error_hint = f"\nPrevious SQL was rejected: {last_error}" if last_error else ""
 
             try:
                 sql = client.generate_sql(question, error_hint)
             except Exception as exc:
                 logger.warning("LLM generate_sql failed (attempt %d): %s", attempt, exc)
-                steps.append({"step": "LLM Error", "detail": f"Attempt {attempt}: LLM call failed."})
-                break   # fall back to deterministic
+                steps.append({"step": "LLM Error", "detail": f"Attempt {attempt}: {_llm_failure_reason(exc)}"})
+                break   # fall back
 
             steps.append({"step": "LLM Action", "detail": f"Attempt {attempt}: LLM returned a response."})
 
-            # fix #5: check for OUT_OF_SCOPE sentinel before SQL validation
+            # the model answers exactly OUT_OF_SCOPE for non-sales questions
             if sql.strip().upper() == "OUT_OF_SCOPE":
                 steps.append({"step": "LLM", "detail": "LLM indicated question is out of scope."})
                 return self._build_response(
@@ -243,25 +275,24 @@ class SalesBIAgent:
                     steps=steps, status="out_of_domain", mode="none", start_time=start_time,
                 )
 
-            # fix #1: use self.validator instance, not the class
             is_valid, sanitized_sql, error_msg = self.validator.validate_and_sanitize(sql)
             if not is_valid:
-                last_error = error_msg   # fix #7
+                last_error = error_msg
                 steps.append({"step": "Validator", "detail": f"Attempt {attempt} rejected: {error_msg}"})
                 if attempt == 1:
-                    continue   # retry once with error fed back
+                    continue   # retry once with the error fed back
                 break          # give up
 
             try:
                 rows = self.db.execute_query(sanitized_sql)
             except SQLValidationError as exc:
-                last_error = str(exc)   # fix #7
+                last_error = str(exc)
                 steps.append({"step": "Validator", "detail": f"Execution blocked (attempt {attempt})."})
                 if attempt == 1:
                     continue
                 break
             except Exception as exc:
-                logger.warning("LLM query execution failed (attempt %d): %s", attempt, exc)  # fix #6
+                logger.warning("LLM query execution failed (attempt %d): %s", attempt, exc)
                 last_error = str(exc)
                 steps.append({"step": "Error", "detail": f"Attempt {attempt}: query execution failed."})
                 if attempt == 1:
@@ -278,7 +309,7 @@ class SalesBIAgent:
                 steps=steps, status="success", mode="llm", start_time=start_time,
             )
 
-        steps.append({"step": "Fallback", "detail": "LLM path exhausted — using deterministic engine."})
+        steps.append({"step": "Fallback", "detail": "LLM path did not produce an answer."})
         return None
 
     # ------------------------------------------------------------------
@@ -325,11 +356,15 @@ class SalesBIAgent:
             steps.append({"step": "Observation",
                           "detail": f"Change: {result['supporting_figures']['direction']} "
                                     f"${abs(result['supporting_figures']['absolute_change']):,.2f}"})
+
         elif intent == "breakdown":
             spec = params["spec"]
-            steps.append({"step": "Action", "detail": f"Deterministic: verified breakdown (measure={spec.metric}, group by={spec.dimension}, filters={spec.filters})"})
+            steps.append({"step": "Action",
+                          "detail": f"Deterministic: verified breakdown (measure={spec.metric}, "
+                                    f"group by={spec.dimension}, filters={spec.filters})"})
             result = self.analytical_engine.breakdown.run(spec)
-            steps.append({"step": "Observation", "detail": f"{len(result.get('table_data', []))} row(s) returned."})
+            steps.append({"step": "Observation",
+                          "detail": f"{len(result.get('table_data', []))} row(s) returned."})
 
         else:
             # Named exploratory SQL branches — guaranteed to have a keyword match
@@ -460,7 +495,7 @@ class SalesBIAgent:
 
 
 # ---------------------------------------------------------------------------
-# Generic row formatter for LLM-generated results  (fix #3)
+# Generic row formatter for LLM-generated results
 # ---------------------------------------------------------------------------
 
 # Column-name tokens that indicate a currency value
@@ -472,19 +507,20 @@ _TIME_TOKENS = frozenset({"year_month", "month", "date", "period", "week", "quar
 
 
 def _fmt(col_name: str, val: Any) -> str:
-    """Format val based on the column name semantics.  Fix #3."""
+    """Format val based on the column name. Percentages are checked before money,
+    so a column like discounted_orders_pct is shown as 8.00% and not as dollars."""
     col = col_name.lower()
     if isinstance(val, (int, float)):
-        if any(t in col for t in _MONEY_TOKENS):
-            return f"${val:,.2f}" if isinstance(val, float) else f"${val:,}"
         if any(t in col for t in _PCT_TOKENS):
             return f"{val:.2f}%"
+        if any(t in col for t in _MONEY_TOKENS):
+            return f"${val:,.2f}" if isinstance(val, float) else f"${val:,}"
         return f"{val:,.2f}" if isinstance(val, float) else f"{val:,}"
     return str(val)
 
 
 def _is_time_series(keys: List[str]) -> bool:
-    """Return True if the first column looks like a time dimension.  Fix #3."""
+    """Return True if the first column looks like a time dimension."""
     col = keys[0].lower()
     return any(t in col for t in _TIME_TOKENS)
 
@@ -495,7 +531,7 @@ def _format_rows(
     """
     Builds a plain-English answer, chart type, chart config, and
     supporting_figures from LLM-generated query rows.
-    The LLM never writes numbers — Python does.  Fix #3.
+    The LLM never writes numbers — Python does.
     """
     if not rows:
         return "The query returned no results.", "table", None, {}
@@ -506,12 +542,12 @@ def _format_rows(
     # Single-row, single-value (e.g. SUM → total)
     if len(rows) == 1 and len(keys) == 1:
         col = keys[0]
-        answer = f"Result: **{col}** = {_fmt(col, first[col])}"
+        answer = f"Result: **{col.replace('_', ' ')}** = {_fmt(col, first[col])}"
         return answer, "metric_card", None, first
 
     # Single-row, multiple values (aggregate summary)
     if len(rows) == 1:
-        parts = [f"{k}: {_fmt(k, v)}" for k, v in first.items()]
+        parts = [f"{k.replace('_', ' ')}: {_fmt(k, v)}" for k, v in first.items()]
         answer = "Summary — " + ", ".join(parts) + "."
         return answer, "metric_card", None, first
 
@@ -520,7 +556,7 @@ def _format_rows(
     value_cols = [k for k in keys[1:] if isinstance(first.get(k), (int, float))]
     value_col = value_cols[-1] if value_cols else keys[-1]  # prefer last numeric (often revenue)
 
-    # fix #3: time-series → report first, last, peak; choose line chart from column names
+    # time series → report first, last, peak; choose the line chart from column names
     if _is_time_series(keys):
         chart_type = "line"
         first_row = rows[0]
@@ -536,8 +572,8 @@ def _format_rows(
         chart_type = "bar"
         top = rows[0]
         answer = (
-            f"Top result: **{top[label_col]}** with {value_col} = {_fmt(value_col, top[value_col])}. "
-            f"({len(rows)} rows returned.)"
+            f"Top result: **{top[label_col]}** with {value_col.replace('_', ' ')} = "
+            f"{_fmt(value_col, top[value_col])}. ({len(rows)} rows returned.)"
         )
 
     chart_config = {

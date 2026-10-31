@@ -93,7 +93,7 @@ sequenceDiagram
 | `src/sql_validator.py` | Token-level validation with `sqlparse`, table whitelist, `LIMIT` enforcement |
 | `src/analytical_engine.py` | Intent detection and the verified SQL for the five benchmark questions |
 | `src/breakdown.py` | Verified SQL for filtered, ranked and grouped questions; filter values are matched against values in the database and SQL comes from fixed templates |
-| `src/llm_client.py` | Calls Gemini through the `google-genai` SDK; 15 second timeout; strips code fences |
+| `src/llm_client.py` | Calls Gemini through the `google-genai` SDK; 30 second timeout; cleans the reply down to one SQL statement |
 | `src/agent.py` | Guards, routing between engine and Gemini, retry and fallback, answer formatting |
 | `src/api.py` | HTTP endpoints, request limits, response model |
 | `static/` | Dashboard: KPI cards, Chart.js chart, data table, SQL and trace panel |

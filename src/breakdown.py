@@ -209,7 +209,7 @@ class BreakdownEngine:
             or spec.limit
             or spec.direction == "asc"
             or (spec.dimension == "month" and spec.direction)
-            or (spec.dimension and spec.metric in ("units", "orders"))
+            or (spec.dimension and spec.metric in ("units", "orders", "aov", "discount"))
         )
 
     # ------------------------------------------------------------------

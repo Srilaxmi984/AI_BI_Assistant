@@ -308,9 +308,10 @@ class AnalyticalEngine:
         Order of decisions:
           1. A month the data does not cover (e.g. July) -> clear "no data" answer.
           2. "Change / compare" between months -> Q5.
-          3. Questions with filters, top/bottom N, or per-group units/orders -> breakdown.
+          3. Percentages and shares -> unknown (goes to the LLM).
           4. Questions mixing several groupings -> unknown (goes to the LLM).
-          5. The four fixed benchmark phrasings.
+          5. Questions with filters, top/bottom N, or per-group measures -> breakdown.
+          6. The four fixed benchmark phrasings.
         """
         q = question.lower().strip()
         spec = self.breakdown.parse(q)
@@ -330,7 +331,12 @@ class AnalyticalEngine:
                 return "revenue_change_between_months", {"m1": min(m1, m2), "m2": max(m1, m2)}
             return "revenue_change_between_months", {"m1": "2026-01", "m2": "2026-02"}
 
-        # 3 and 4. flexible questions
+        # 3. percentages and shares are not a verified shape (for example "what percentage
+        #    of revenue came from online sales" would otherwise return the plain online revenue)
+        if any(w in q for w in ("percent", "percentage", "proportion", "ratio", "share of")):
+            return "unknown", {}
+
+        # 4. flexible questions
         if spec.multi_dimension:
             return "unknown", {}
         if self.breakdown.wants_breakdown(spec):

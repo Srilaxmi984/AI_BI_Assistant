@@ -1,7 +1,9 @@
 """
-test_llm.py — Phase 1 / 1B tests for LLM integration and guardrails.
+test_llm.py — tests for LLM integration and guardrails.
 
 All LLM API calls are MOCKED — no real network traffic is made.
+(tests/conftest.py also makes the real Gemini client fail instantly, so a test that
+forgets to mock the model cannot reach the network.)
 """
 
 import pytest
@@ -12,6 +14,12 @@ from fastapi.testclient import TestClient
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+PCT_SQL = (
+    "SELECT ROUND(100.0 * SUM(CASE WHEN discount_amount > 0 THEN 1 ELSE 0 END) / COUNT(*), 2) "
+    "AS discounted_orders_pct FROM v_completed_sales"
+)
+
 
 def _make_mock_client(sql: str):
     mock = MagicMock()
@@ -30,25 +38,52 @@ class TestLLMAgentMocked:
         from src.agent import SalesBIAgent
         return SalesBIAgent()
 
-    # -- Fix #4: can't-answer gate when LLM is unavailable -----------------
+    # -- The LLM path really works ------------------------------------------
+
+    def test_valid_llm_sql_gives_mode_llm(self, agent):
+        """A valid SELECT from the model is validated, run, and answered with mode=llm."""
+        mock_client = _make_mock_client(PCT_SQL)
+        with patch("src.llm_client.LLMClient", return_value=mock_client):
+            res = agent.process_question("What percentage of completed orders had a discount?")
+        assert res["status"] == "success"
+        assert res["mode"] == "llm"
+        assert res["sql_query"].upper().startswith("SELECT")
+        assert "8.00%" in res["answer"]          # 4 of 50 completed orders had a discount
+        mock_client.generate_sql.assert_called_once()
+
+    def test_numbers_come_from_the_rows_not_from_the_model(self, agent):
+        """Whatever text the model adds, the answer shows the database result."""
+        mock_client = _make_mock_client(PCT_SQL)
+        with patch("src.llm_client.LLMClient", return_value=mock_client):
+            res = agent.process_question("What percentage of completed orders had a discount?")
+        assert res["table_data"][0]["discounted_orders_pct"] == 8.0
+
+    # -- Unknown question when the LLM is unavailable -------------------------
 
     def test_unknown_question_no_llm_returns_cant_answer(self, agent):
-        """With no LLM and no exploratory keyword, return 'can't answer', mode=none."""
-        with patch("src.config.GOOGLE_API_KEY", ""), \
-             patch("src.config.LLM_ENABLED", True):
+        """With the key missing and no exploratory keyword: 'can't answer', mode=none."""
+        with patch("src.llm_client.GOOGLE_API_KEY", ""):
             res = agent.process_question("What is the meaning of life?")
         assert res["status"] == "out_of_domain"
         assert res["mode"] == "none"
         assert "can't answer" in res["answer"].lower()
+        # the trace says why Gemini was not used
+        assert any("no api key" in s["detail"].lower() for s in res["reasoning_trace"])
 
-    # -- Fix #5: OUT_OF_SCOPE sentinel ----------------------------------------
+    def test_percentage_question_without_gemini_is_not_answered_wrongly(self, agent):
+        """The 'discount' keyword branch would return total discounts, which is a different figure."""
+        with patch("src.llm_client.GOOGLE_API_KEY", ""):
+            res = agent.process_question("What percentage of completed orders had a discount?")
+        assert res["mode"] == "none"
+        assert "can't answer" in res["answer"].lower()
+        assert "4,500" not in res["answer"]
+
+    # -- OUT_OF_SCOPE sentinel ------------------------------------------------
 
     def test_llm_out_of_scope_sentinel_maps_to_out_of_domain(self, agent):
         """When LLM returns OUT_OF_SCOPE, map to status=out_of_domain, mode=none."""
         mock_client = _make_mock_client("OUT_OF_SCOPE")
         with patch("src.llm_client.LLMClient", return_value=mock_client), \
-             patch("src.config.LLM_ENABLED", True), \
-             patch("src.config.GOOGLE_API_KEY", "fake-key"), \
              patch.object(agent.analytical_engine, "detect_intent",
                           return_value=("unknown", {})):
             res = agent.process_question("Who won the cricket World Cup?")
@@ -56,7 +91,7 @@ class TestLLMAgentMocked:
         assert res["mode"] == "none"
         assert res["sql_query"] == ""
 
-    # -- Fix #6: no raw exception text to users --------------------------------
+    # -- No raw exception text to users --------------------------------------
 
     def test_deterministic_error_returns_generic_message(self, agent):
         """Engine crash must not expose raw exception text to the user."""
@@ -69,7 +104,17 @@ class TestLLMAgentMocked:
         assert "internal db error xyz" not in res["answer"]
         assert "internal error" in res["answer"].lower()
 
-    # -- Fix #7: no class-level _last_llm_error attribute ----------------------
+    def test_llm_failure_reason_is_shown_without_raw_error_text(self, agent):
+        """The trace explains a Gemini failure in plain words and never repeats the raw error."""
+        mock_client = MagicMock()
+        mock_client.generate_sql.side_effect = Exception("403 PERMISSION_DENIED secret-details")
+        with patch("src.llm_client.LLMClient", return_value=mock_client):
+            res = agent.process_question("What is the average order value?")
+        trace = " ".join(s["detail"] for s in res["reasoning_trace"])
+        assert "permission or billing" in trace.lower()
+        assert "secret-details" not in trace
+
+    # -- No class-level _last_llm_error attribute ------------------------------
 
     def test_no_class_level_last_llm_error(self):
         """SalesBIAgent must not have a _last_llm_error class attribute."""
@@ -77,7 +122,7 @@ class TestLLMAgentMocked:
         assert not hasattr(SalesBIAgent, "_last_llm_error"), \
             "_last_llm_error must be a local variable, not a class attribute"
 
-    # -- Fix #1 : validator called via instance --------------------------------
+    # -- Validator is used for model-written SQL --------------------------------
 
     def test_validator_instance_used_in_try_llm(self, agent):
         """LLM SQL must be validated through self.validator (the instance)."""
@@ -85,8 +130,6 @@ class TestLLMAgentMocked:
         mock_client = _make_mock_client(valid_sql)
 
         with patch("src.llm_client.LLMClient", return_value=mock_client), \
-             patch("src.config.LLM_ENABLED", True), \
-             patch("src.config.GOOGLE_API_KEY", "fake-key"), \
              patch.object(agent.analytical_engine, "detect_intent",
                           return_value=("unknown", {})), \
              patch.object(agent.validator, "validate_and_sanitize",
@@ -95,7 +138,7 @@ class TestLLMAgentMocked:
 
         assert mock_val.call_count >= 1, "self.validator.validate_and_sanitize was not called"
 
-    # -- Fix #8: all 5 deterministic queries pass through SQLValidator ---------
+    # -- All 5 deterministic queries pass through SQLValidator -------------------
 
     def test_total_revenue_goes_through_validator(self, agent):
         """get_total_revenue SQL must pass through database.execute_query/validator."""
@@ -143,42 +186,49 @@ class TestLLMAgentMocked:
         assert res["status"] == "success"
         assert mock_val.call_count >= 1
 
-    # -- LLM drop-table fallback -----------------------------------------------
+    # -- Destructive or broken model output ---------------------------------------
+    # "What is the average order value?" is not one of the fixed intents, so it
+    # really goes to the model, and the exploratory branch answers if the model fails.
 
-    def test_llm_drop_table_fallback_to_deterministic(self, agent):
-        """LLM returning DROP TABLE is rejected; agent falls back to deterministic."""
+    def test_llm_drop_table_is_rejected_retried_then_falls_back(self, agent):
+        """DROP TABLE from the model is rejected twice; the verified branch answers instead."""
         mock_client = _make_mock_client("DROP TABLE sales_transactions")
-        with patch("src.llm_client.LLMClient", return_value=mock_client), \
-             patch("src.config.LLM_ENABLED", True), \
-             patch("src.config.GOOGLE_API_KEY", "fake-key"), \
-             patch.object(agent.analytical_engine, "detect_intent",
-                          return_value=("total_revenue", {})):
-            res = agent.process_question("What is the total revenue?")
+        with patch("src.llm_client.LLMClient", return_value=mock_client):
+            res = agent.process_question("What is the average order value?")
+        assert mock_client.generate_sql.call_count == 2        # first try + one retry
         assert res["status"] == "success"
         assert res["mode"] == "deterministic"
+        assert "average order value" in res["answer"].lower()
 
-    def test_llm_failure_fallback_to_deterministic(self, agent):
-        """LLM exception → deterministic fallback."""
+    def test_stacked_statement_from_llm_is_rejected_and_data_survives(self, agent):
+        """'SELECT ...; DROP TABLE ...' must never run, and the table must still exist after."""
+        mock_client = _make_mock_client("SELECT 1; DROP TABLE sales_transactions")
+        with patch("src.llm_client.LLMClient", return_value=mock_client):
+            res = agent.process_question("What is the average order value?")
+        assert res["mode"] == "deterministic"
+        after = agent.process_question("What is the total revenue?")
+        assert "1,445,200.00" in after["answer"]
+
+    def test_llm_failure_falls_back_without_retrying(self, agent):
+        """A Gemini error (timeout, quota, ...) falls back at once; retrying would not help."""
         from src.llm_client import LLMGenerationError
         mock_client = MagicMock()
         mock_client.generate_sql.side_effect = LLMGenerationError("timeout")
-        with patch("src.llm_client.LLMClient", return_value=mock_client), \
-             patch("src.config.LLM_ENABLED", True), \
-             patch("src.config.GOOGLE_API_KEY", "fake-key"), \
-             patch.object(agent.analytical_engine, "detect_intent",
-                          return_value=("total_revenue", {})):
-            res = agent.process_question("What is the total revenue?")
+        with patch("src.llm_client.LLMClient", return_value=mock_client):
+            res = agent.process_question("What is the average order value?")
+        assert mock_client.generate_sql.call_count == 1
         assert res["status"] == "success"
         assert res["mode"] == "deterministic"
 
     def test_no_key_gives_deterministic(self, agent):
-        """No API key → deterministic, correct benchmark answer."""
-        with patch("src.config.GOOGLE_API_KEY", ""), \
-             patch("src.config.LLM_ENABLED", True):
+        """No API key → the benchmark answer is still correct and deterministic."""
+        with patch("src.llm_client.GOOGLE_API_KEY", ""):
             res = agent.process_question("What is the total revenue?")
         assert res["status"] == "success"
         assert res["mode"] == "deterministic"
         assert "1,445,200.00" in res["answer"]
+
+    # -- Question text guards ------------------------------------------------------
 
     def test_malicious_question_drop_table(self, agent):
         """DROP TABLE in question text → rejected, mode=none, no SQL run."""
@@ -204,7 +254,7 @@ class TestLLMAgentMocked:
         assert res["status"] == "out_of_domain"
         assert res["mode"] == "none"
 
-    # -- Benchmark deterministic answers --------------------------------------
+    # -- Benchmark deterministic answers --------------------------------------------
 
     def test_benchmark_total_revenue(self, agent):
         res = agent.process_question("What is the total revenue?")

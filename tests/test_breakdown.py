@@ -117,3 +117,27 @@ def test_agent_answers_a_filtered_question_without_the_llm():
 def test_agent_reports_missing_month():
     res = SalesBIAgent().process_question("Revenue in July")
     assert "no sales data" in res["answer"].lower()
+
+
+# ---- questions that used to get a wrong or different answer ----
+
+def test_highest_average_order_value_uses_the_average_not_revenue(engine):
+    res = run(engine, "Which product has the highest average order value?")
+    assert res["table_data"][0]["product"] == "Monitor"
+    assert res["table_data"][0]["avg_order_value"] == pytest.approx(52555.56)
+    assert "$473,000.00" not in res["answer"]       # that is Monitor's total revenue, a different figure
+
+
+def test_average_order_value_by_region_is_grouped_by_region(engine):
+    res = run(engine, "What is the average order value by region?")
+    assert {r["region"] for r in res["table_data"]} == {"South", "North", "East", "West"}
+
+
+def test_percentage_questions_go_to_the_llm(engine):
+    assert engine.detect_intent("What percentage of revenue came from online sales?")[0] == "unknown"
+    assert engine.detect_intent("What share of orders had a discount?")[0] == "unknown"
+
+
+def test_percentage_change_between_months_is_still_the_verified_comparison(engine):
+    assert engine.detect_intent("What was the percentage change between January and February?")[0] == \
+        "revenue_change_between_months"

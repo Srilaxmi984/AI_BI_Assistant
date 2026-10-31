@@ -18,14 +18,14 @@ The app uses two paths, and the response always says which one was used in its `
 
 How the Gemini path works:
 
-1. The model receives the question, the schema and the allowed views, and writes **one SELECT**.
+1. The model receives the question, the schema and the allowed views, and writes **one SELECT**. Its reply is cleaned down to a single statement; anything that is not one SELECT (for example `SELECT 1; DROP TABLE x`) is passed on unchanged so the validator rejects it.
 2. The SQL is validated (see Security below) and run on a read-only connection.
 3. The answer text is built by **Python from the returned rows**. The model never writes the numbers.
-4. If validation fails, the app retries once, feeding the error back to the model. If that also fails, or there is no API key, or the model errors, it falls back to the verified engine or says it cannot answer.
+4. If validation fails, the app retries once, feeding the error back to the model. If that also fails, or there is no API key, or the model errors or times out (30 seconds), it falls back to the verified engine or says it cannot answer. The reasoning trace shows why Gemini was not used.
 
 The app works without an API key: the verified engine handles all benchmark questions and the question types listed below.
 
-Example of a question that goes to Gemini because the verified engine does not cover it: *"What percentage of completed orders had a discount?"*
+Examples of questions that go to Gemini because the verified engine does not cover them: *"What percentage of completed orders had a discount?"* (8.00%), *"What percentage of revenue came from online sales?"* (52.09%), *"What is the average discount per discounted order?"* ($1,125.00), *"Which orders had an imputed price?"* (TXN0051).
 
 ---
 
@@ -40,9 +40,9 @@ Besides the five benchmark questions, `src/breakdown.py` answers questions built
 | Filter | a month (`in March`), region (`South`), product (`Monitor`), category or channel |
 | Ranking | `top 3`, `bottom 2`, `highest`, `lowest`, `fewest`, `most` |
 
-Examples: *"What was the revenue in January?"*, *"Top 3 regions by revenue"*, *"Which region has the lowest revenue?"*, *"How many units were sold per product?"*, *"Number of orders per region"*, *"Revenue by region in March"*, *"What is the revenue of Monitor?"*, *"Which month had the highest revenue?"*.
+Examples: *"What was the revenue in January?"*, *"Top 3 regions by revenue"*, *"Which region has the lowest revenue?"*, *"How many units were sold per product?"*, *"Number of orders per region"*, *"Revenue by region in March"*, *"What is the revenue of Monitor?"*, *"Which month had the highest revenue?"*, *"Which product has the highest average order value?"*, *"What is the average order value by region?"*.
 
-How it stays safe and exact: filter values are matched against values that exist in the database, and the SQL is built from fixed templates, so no text from the question is ever placed into a query. A month outside the data (for example July) gets a clear "no sales data" answer. Questions that combine two groupings (for example "by product and region") are passed to Gemini.
+How it stays safe and exact: filter values are matched against values that exist in the database, and the SQL is built from fixed templates, so no text from the question is ever placed into a query. A month outside the data (for example July) gets a clear "no sales data" answer. Questions that combine two groupings (for example "by product and region") are passed to Gemini. So are questions about percentages or shares (for example "what percentage of revenue came from online sales?").
 
 ---
 
@@ -79,9 +79,10 @@ AI_BI_Assistant/
 │   ├── agent.py                   # Guards, routing, LLM path, answer building
 │   └── api.py                     # FastAPI app and static file server
 ├── static/                        # index.html, style.css, app.js (Chart.js UI)
-├── tests/                         # pytest suite (LLM is always mocked); test_breakdown.py covers the flexible questions
+├── tests/                         # pytest suite; conftest.py keeps every test off the real Gemini API
 ├── docs/
 │   ├── architecture.md            # Diagrams and design explanation
+│   ├── ui.png                     # Screenshot of the dashboard
 │   └── cloud_deployment_aws.md    # Future work note (not implemented)
 ├── .env.example                   # Settings template (no secrets)
 ├── pytest.ini
@@ -182,12 +183,13 @@ python run.py
 python -m pytest -q
 ```
 
-The suite has **78 tests** covering ETL, the SQL validator, the five benchmark answers, the filtered and ranked questions, the agent and its guards, the REST API, and the LLM path.
+The suite has **92 tests** covering ETL, the SQL validator, the five benchmark answers, the filtered and ranked questions, the agent and its guards, the REST API, and the LLM path.
 
-- The LLM is **mocked** in every test, so no API key or network is needed.
+- The LLM is **mocked** in every test, so no API key or network is needed. `tests/conftest.py` also replaces the Gemini client with one that fails instantly, so a test that forgets to mock the model can never reach the real API.
 - Valid questions: all five benchmark answers are asserted to the exact figure.
 - Invalid and malicious input: empty question, a 501-character question (HTTP 422), `DROP TABLE` in the question text, stacked queries, destructive SQL returned by a mocked model.
 - Filtered and ranked questions: top N, lowest, per-group units and orders, month filters, a month with no data, and checks that the groups add up to the totals.
+- Gemini replies: a reply with commentary around the SQL is cleaned to one statement, and a stacked statement is passed on so the validator rejects it.
 - Edge cases: out-of-domain questions, ordinary words such as "market" not being read as months, model failure with fallback, no API key, "show me the revenue update for May" (the word "update" must not trigger a rejection), and a check that SQL from the model is validated before it runs.
 
 ---
@@ -197,9 +199,10 @@ The suite has **78 tests** covering ETL, the SQL validator, the five benchmark a
 1. `src/etl.py` loads `data/raw/sales_data.csv` (51 transactions).
 2. Cleaning rules:
    - Dates in `DD-MM-YYYY` are converted to ISO `YYYY-MM-DD`, and a `year_month` column (`YYYY-MM`) is added and indexed so months sort correctly.
-   - The one missing unit price (`TXN0051`, Laptop Stand) is filled from the product catalog price ($1,200) and flagged `is_imputed = 1`.
+   - The one missing unit price (`TXN0051`, Laptop Stand) is filled from the product catalog price ($1,200) and flagged `IMPUTED_UNIT_PRICE` in the `data_quality_flag` column.
    - The zero-quantity order (`TXN0034`) is flagged `ZERO_QUANTITY` and contributes $0 revenue.
    - The returned order (`TXN0033`, Monitor, $19,000) is flagged `RETURNED_ORDER`.
+   - Every other row is flagged `VALID`.
    - Every fix is written to the `data_quality_audit` table with a timestamp.
 3. Data is stored in SQLite (`data/processed/sales.db`):
    - `sales_transactions`: all records, including the returned one, for auditing.
@@ -236,6 +239,8 @@ Preventing wrong answers: numbers in answers are computed or formatted by Python
 - Only completed orders count as revenue; the returned order is excluded.
 - The verified engine recognises a limited set of question types (the benchmark questions and the filter, ranking and grouping combinations listed above); anything else depends on the Gemini path. Without an API key, other questions get a clear "cannot answer" message.
 - SQL written by the model is not guaranteed to match what the user meant, which is why the SQL and rows are always displayed.
+- The Gemini path needs an API key from a Google project that has access to the Gemini API, and a call can be slow or time out. When that happens the app falls back to the verified engine, or says it cannot answer, and the trace panel shows the reason.
+- Percentage, share and ratio questions need Gemini. Without it they get a clear "cannot answer" and never a different figure.
 - There is no multi-turn memory: each question is answered on its own.
 - Out-of-domain detection uses a keyword list plus the model's own refusal, so unusual off-topic questions can slip through to the model path.
 - Validation is token-level (sqlparse), not a full parser.
