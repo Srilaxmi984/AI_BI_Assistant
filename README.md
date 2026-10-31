@@ -82,7 +82,6 @@ AI_BI_Assistant/
 ├── tests/                         # pytest suite; conftest.py keeps every test off the real Gemini API
 ├── docs/
 │   ├── architecture.md            # Diagrams and design explanation
-│   ├── ui.png                     # Screenshot of the dashboard
 │   └── cloud_deployment_aws.md    # Future work note (not implemented)
 ├── .env.example                   # Settings template (no secrets)
 ├── pytest.ini
